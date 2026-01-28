@@ -89,11 +89,11 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
         context_length=131072,  # 128K native
         gpu_memory_utilization=GPU_MEM_UTIL,
     ),
-    # Qwen3 VL 32B with thinking - vision model (native 256K, expandable to 1M)
+    # Qwen3 VL 32B with thinking - vision model (limited to 128K for memory)
     "qwen3-vl-32b-thinking": ModelInfo(
         name="qwen3-vl-32b-thinking",
         hf_path="Qwen/Qwen3-VL-32B-Thinking-FP8",
-        context_length=262144,  # 256K native
+        context_length=131072,  # 128K (256K native but limited for KV cache memory)
         gpu_memory_utilization=GPU_MEM_UTIL,
         supports_vision=True,
         quantization="fp8",
@@ -415,7 +415,7 @@ async def chat_completions(request: ChatCompletionRequest):
     state.request_count += 1
 
     logger.info(f"[{request_id}] POST /v1/chat/completions")
-    logger.info(f"[{request_id}] model={request.model}, messages={len(request.messages)}, max_tokens={request.max_tokens}")
+    logger.info(f"[{request_id}] model={request.model}, messages={len(request.messages)}, max_tokens={request.max_tokens}, stream={request.stream}")
 
     # Log actual message content for debugging
     for i, msg in enumerate(request.messages):
@@ -511,7 +511,48 @@ async def chat_completions(request: ChatCompletionRequest):
         response_preview = generated_text[:500] + "..." if len(generated_text) > 500 else generated_text
         logger.info(f"[{request_id}] RESPONSE: {response_preview}")
 
-        # Build response
+        # Handle streaming response
+        if request.stream:
+            async def generate_stream():
+                created = int(time.time())
+                # Send content in chunks (simulated streaming)
+                chunk_size = 20  # characters per chunk
+                for i in range(0, len(generated_text), chunk_size):
+                    chunk = generated_text[i:i+chunk_size]
+                    data = {
+                        "id": f"chatcmpl-{request_id}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": chunk},
+                            "finish_reason": None,
+                        }]
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                # Send final chunk with finish_reason
+                data = {
+                    "id": f"chatcmpl-{request_id}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason or "stop",
+                    }]
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        # Build non-streaming response
         response = ChatCompletionResponse(
             id=f"chatcmpl-{request_id}",
             created=int(time.time()),
