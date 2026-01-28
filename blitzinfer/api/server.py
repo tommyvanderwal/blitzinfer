@@ -66,69 +66,69 @@ class ModelInfo:
 
 
 # Available models on RTX PRO 6000 (95GB VRAM)
-# Use 95% GPU memory and each model's maximum supported context length
+# Use 95% GPU memory and maximum context lengths (with RoPE scaling where needed)
 GPU_MEM_UTIL = 0.95  # Use ~90GB of 95GB VRAM
 
 AVAILABLE_MODELS: Dict[str, ModelInfo] = {
-    # GPT-OSS-120B - largest model, MXFP4 quantized (max 128K context)
+    # GPT-OSS-120B - largest model, MXFP4 quantized (native 128K)
     "gpt-oss-120b": ModelInfo(
         name="gpt-oss-120b",
         hf_path="openai/gpt-oss-120b",
-        context_length=131072,
+        context_length=131072,  # 128K native
         gpu_memory_utilization=GPU_MEM_UTIL,
     ),
-    # Qwen3 VL 32B with thinking - vision model (max 32K context)
+    # Qwen3 VL 32B with thinking - vision model (native 256K, expandable to 1M)
     "qwen3-vl-32b-thinking": ModelInfo(
         name="qwen3-vl-32b-thinking",
         hf_path="Qwen/Qwen3-VL-32B-Thinking-FP8",
-        context_length=32768,
+        context_length=262144,  # 256K native
         gpu_memory_utilization=GPU_MEM_UTIL,
         supports_vision=True,
         quantization="fp8",
     ),
-    # Qwen3 32B FP8 - fast text model (max 40960 context)
+    # Qwen3 32B FP8 - fast text model (RoPE scaling to 128K)
     "qwen3-32b": ModelInfo(
         name="qwen3-32b",
         hf_path="Qwen/Qwen3-32B-FP8",
-        context_length=40960,
+        context_length=131072,  # 128K with RoPE scaling
         gpu_memory_utilization=GPU_MEM_UTIL,
         quantization="fp8",
     ),
-    # Mistral Small 24B - efficient model (max 128K context)
+    # Mistral Small 24B - efficient model (native 128K)
     "mistral-small-24b": ModelInfo(
         name="mistral-small-24b",
         hf_path="mistralai/Mistral-Small-3.2-24B-Instruct-2506",
-        context_length=131072,
+        context_length=131072,  # 128K native
         gpu_memory_utilization=GPU_MEM_UTIL,
     ),
-    # Llama 3.1 70B AWQ - popular model (max 128K context)
+    # Llama 3.1 70B AWQ - popular model (native 128K)
     "llama-3.1-70b": ModelInfo(
         name="llama-3.1-70b",
         hf_path="hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4",
-        context_length=131072,
+        context_length=131072,  # 128K native
         gpu_memory_utilization=GPU_MEM_UTIL,
         quantization="awq",
     ),
-    # Qwen 2.5 72B - large Qwen model (max 128K context)
+    # Qwen 2.5 72B - large Qwen model (RoPE scaling to 128K)
     "qwen2.5-72b": ModelInfo(
         name="qwen2.5-72b",
         hf_path="Qwen/Qwen2.5-72B-Instruct",
-        context_length=131072,
+        context_length=131072,  # 128K with RoPE scaling
         gpu_memory_utilization=GPU_MEM_UTIL,
     ),
-    # Kimi VL - vision model (max 128K context)
+    # Kimi VL - vision model (native 128K)
     "kimi-vl": ModelInfo(
         name="kimi-vl",
         hf_path="moonshotai/Kimi-VL-A3B-Thinking-2506",
-        context_length=131072,
+        context_length=131072,  # 128K
         gpu_memory_utilization=GPU_MEM_UTIL,
         supports_vision=True,
     ),
-    # GLM 4.6V Flash - fast vision (max 8K context)
+    # GLM 4.6V Flash - fast vision (native 128K)
     "glm-4.6v-flash": ModelInfo(
         name="glm-4.6v-flash",
         hf_path="zai-org/GLM-4.6V-Flash",
-        context_length=8192,
+        context_length=131072,  # 128K
         gpu_memory_utilization=GPU_MEM_UTIL,
         supports_vision=True,
     ),
