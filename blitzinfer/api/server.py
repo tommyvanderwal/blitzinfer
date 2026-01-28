@@ -26,6 +26,18 @@ os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'
 
 from vllm import LLM, SamplingParams
 
+# Import Harmony parser for GPT-OSS input/output formatting
+try:
+    from vllm.entrypoints.openai.parser.harmony_utils import (
+        parse_chat_output,
+        parse_chat_inputs_to_harmony_messages,
+        render_for_completion,
+        get_system_message,
+    )
+    HAS_HARMONY = True
+except ImportError:
+    HAS_HARMONY = False
+
 # BlitzInfer imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from blitzinfer.engine.cleanup import full_cleanup
@@ -405,6 +417,12 @@ async def chat_completions(request: ChatCompletionRequest):
     logger.info(f"[{request_id}] POST /v1/chat/completions")
     logger.info(f"[{request_id}] model={request.model}, messages={len(request.messages)}, max_tokens={request.max_tokens}")
 
+    # Log actual message content for debugging
+    for i, msg in enumerate(request.messages):
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        content_preview = content[:500] + "..." if len(content) > 500 else content
+        logger.info(f"[{request_id}] MSG[{i}] {msg.role}: {content_preview}")
+
     try:
         # Resolve model alias
         model_id = MODEL_ALIASES.get(request.model, request.model)
@@ -418,8 +436,29 @@ async def chat_completions(request: ChatCompletionRequest):
             await state.switch_model(model_id)
 
         # Build prompt from messages
-        prompt = _format_chat_messages(request.messages)
-        logger.debug(f"[{request_id}] Prompt length: {len(prompt)} chars")
+        # For GPT-OSS, use Harmony encoding for proper structured output
+        use_harmony = HAS_HARMONY and model_id == "gpt-oss-120b"
+        prompt_token_ids = None
+
+        if use_harmony:
+            try:
+                # Convert messages to dict format for Harmony
+                chat_msgs = [{"role": m.role, "content": m.content} for m in request.messages]
+                # Add system message if not present
+                if not any(m.get("role") == "system" for m in chat_msgs):
+                    sys_msg = get_system_message()
+                    harmony_msgs = [sys_msg] + parse_chat_inputs_to_harmony_messages(chat_msgs)
+                else:
+                    harmony_msgs = parse_chat_inputs_to_harmony_messages(chat_msgs)
+                prompt_token_ids = render_for_completion(harmony_msgs)
+                logger.debug(f"[{request_id}] Harmony prompt: {len(prompt_token_ids)} tokens")
+            except Exception as e:
+                logger.warning(f"[{request_id}] Harmony encoding failed: {e}, using text prompt")
+                use_harmony = False
+
+        if not use_harmony:
+            prompt = _format_chat_messages(request.messages)
+            logger.debug(f"[{request_id}] Text prompt length: {len(prompt)} chars")
 
         # Create sampling params
         sampling_params = SamplingParams(
@@ -433,21 +472,44 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Generate
         start = time.time()
-        outputs = state.llm.generate([prompt], sampling_params)
+        if prompt_token_ids:
+            # Pass as TokensPrompt dict
+            outputs = state.llm.generate([{"prompt_token_ids": prompt_token_ids}], sampling_params)
+        else:
+            outputs = state.llm.generate([prompt], sampling_params)
         elapsed = time.time() - start
 
         output = outputs[0]
         generated_text = output.outputs[0].text
         finish_reason = output.outputs[0].finish_reason
+        output_token_ids = output.outputs[0].token_ids
 
         # Count tokens
         prompt_tokens = len(output.prompt_token_ids)
-        completion_tokens = len(output.outputs[0].token_ids)
+        completion_tokens = len(output_token_ids)
         total_tokens = prompt_tokens + completion_tokens
         state.total_tokens += total_tokens
 
         tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
         logger.info(f"[{request_id}] Generated {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+
+        # For GPT-OSS models, parse the Harmony format to extract final content
+        reasoning_content = None
+        if HAS_HARMONY and model_id == "gpt-oss-120b":
+            try:
+                reasoning, final_content, _ = parse_chat_output(list(output_token_ids))
+                if final_content:
+                    logger.info(f"[{request_id}] Harmony parsed: reasoning={len(reasoning or '')} chars, final={len(final_content)} chars")
+                    reasoning_content = reasoning
+                    generated_text = final_content
+                else:
+                    logger.warning(f"[{request_id}] Harmony parse returned no final content, using raw output")
+            except Exception as e:
+                logger.warning(f"[{request_id}] Harmony parse failed: {e}, using raw output")
+
+        # Log response content for debugging
+        response_preview = generated_text[:500] + "..." if len(generated_text) > 500 else generated_text
+        logger.info(f"[{request_id}] RESPONSE: {response_preview}")
 
         # Build response
         response = ChatCompletionResponse(
