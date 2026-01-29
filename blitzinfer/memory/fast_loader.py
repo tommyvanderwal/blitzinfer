@@ -173,7 +173,7 @@ def load_model_to_arena(
     model_path: str,
     arena: PinnedMemoryArena,
     model_name: Optional[str] = None,
-    parallel_workers: int = 4,
+    parallel_workers: int = 16,  # Increased for NVMe queue depth
 ) -> Dict[str, TensorMeta]:
     """Load all model safetensors into the arena.
 

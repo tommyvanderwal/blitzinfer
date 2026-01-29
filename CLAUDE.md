@@ -6,7 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **BlitzInfer** is a high-performance LLM serving orchestrator optimized for fast model switching with intelligent queue management and tiered memory caching.
 
-**Current Status**: Phase 2-3 - Fast model switching achieved. Cross-architecture switching (Qwen-32B ↔ gpt-oss-120b) working with ~9-13s switches.
+**Current Status**: Phase 2-3 - Fast model switching achieved. Queue-driven prefetch working with ~5-10s warm switches.
+
+## Latest Test Results (Jan 2026)
+
+**Queue-Driven Test (`test_queue_simple.py`):**
+
+| Metric | Result | Target | Status |
+|--------|--------|--------|--------|
+| Preload time (max) | 8.41s | < 10s | **PASS** |
+| Memory drift | 0.48GB | < 2GB | **PASS** |
+| Weight injection | 39.3 GB/s | - | Excellent |
+| GPT-OSS switch (warm) | 5.36s | < 10s | **PASS** |
+| Qwen VL switch | 16.60s | < 10s | FAIL (vision overhead) |
+| GPT-OSS tool calls | ✓ | - | **PASS** |
+| Qwen VL vision | ✓ | - | **PASS** |
+
+**Key findings:**
+- Weight injection is fast (39.3 GB/s) - bottleneck is vLLM model init
+- Vision models have inherent encoder setup overhead (~6s extra)
+- Warm switches achieve <10s target for text models
+- Memory cleanup is stable (0.48GB drift over 3 switches)
 
 ## Completed
 
@@ -21,10 +41,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [x] **Page cache warming** for background model prefetch (~12 GB/s)
 - [x] **Orchestrator integration** with PageCacheWarmer (1.44x speedup, 10/10 switches)
 - [x] **Pinned arena loader** for fast CPU→GPU transfer (44.4 GB/s, 1.37x speedup)
-- [x] **Standby manager** (1 active + 1 standby pattern) - **6.8s switches, 3.8x speedup**
+- [x] **Standby manager** (1 active + 1 standby pattern) - **5.36s warm switches**
 - [x] **Static 80GB pinned arena** (5x 16GB power-of-2 chunks, 0% overhead)
 - [x] **Aggressive GPU cleanup** for vLLM V1 single-process mode
 - [x] **Cross-architecture switching** (Qwen-32B ↔ gpt-oss-120b) - InprocClient navigation fix
+- [x] **GPT-OSS Harmony tool calls** - Working with proper encoding
+- [x] **Qwen VL vision input** - Working with PIL Image format
+
+## WARNING: AWQ Marlin Intermittent Crash Bug (Jan 2026)
+
+**BUG**: The `awq_marlin` quantization kernel causes **intermittent hard system freeze** on RTX PRO 6000 Blackwell.
+
+| Quantization | Result |
+|-------------|--------|
+| `awq_marlin` | ⚠️ **INTERMITTENT CRASH** (may require power cycle) |
+| `awq` standard | ✅ Works |
+| `mxfp4` Marlin | ✅ Works |
+
+**Findings**:
+- Fresh cold boots: 6/6 tests passed (both awq_marlin and awq)
+- After model switching/extended tests: Crashes occurred
+- Suspected trigger: Accumulated GPU/driver state from model switching
+
+**Workaround**: Use `quantization='awq'` for production reliability:
+```python
+llm = LLM(
+    model='hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4',
+    quantization='awq',  # NOT 'awq_marlin' - safer for Blackwell
+    ...
+)
+```
+
+**Trade-off**: Standard AWQ is ~10x slower than Marlin but works reliably.
+
+**Bug Report**: `tests/AWQ_MARLIN_CRASH_BUG_REPORT.md`
 
 ## Architecture
 
@@ -240,6 +290,54 @@ This applies to:
 |------|---------------|-------------|-------|
 | **Single-process (`=0`)** | ✓ Fixed | ~10-13s | Use this for fast switching |
 | Multiprocessing (`=1`) | ✓ Works | ~30s | Slower but more isolated |
+
+## BIOS Crash with llama-AWQ (CRITICAL - Jan 2026)
+
+**Problem**: Loading `llama-3.1-70B-AWQ-INT4` after multiple model switches with StandbyManager causes system-level crash (BIOS freeze, requires power cycle).
+
+### Crash Pattern
+- Crash is **non-deterministic** (sometimes passes, sometimes crashes)
+- Occurs when loading AWQ Marlin model AFTER prior model switches
+- Crash happens during safetensors loading or marlin initialization
+- 100% CPU on 1 core for 2-7 seconds before crash
+
+### Root Cause (Investigation Jan 2026)
+Cumulative GPU state corruption from multiple load/cleanup cycles:
+1. Multiple model switches corrupt internal CUDA/driver state
+2. AWQ Marlin kernel (used by llama-AWQ) encounters corrupted state
+3. Marlin initialization fails catastrophically → BIOS crash
+
+### Tested Scenarios
+| Scenario | Result |
+|----------|--------|
+| full_cleanup() without StandbyManager | **PASS** |
+| StandbyManager (lazy) + 1 switch + llama | **CRASH** (non-deterministic) |
+| StandbyManager deleted before cleanup + llama | **PASS** |
+| llama-AWQ as FIRST model (no prior switches) | **PASS** |
+| Multiple switches (3+) then llama-AWQ | **CRASH** (consistent) |
+
+### Workarounds
+For reliable llama-3.1-70B-AWQ-INT4 loading:
+
+1. **Delete StandbyManager before cleanup** (safest):
+```python
+standby.shutdown()
+del standby
+gc.collect()
+freed = full_cleanup(llm)
+# Now safe to load llama-AWQ
+```
+
+2. **Restart Python process** before loading llama-AWQ after multiple switches
+
+3. **Load llama-AWQ first** (no prior model switches)
+
+### Not Affected
+- gpt-oss-120b (mxfp4 quantization) - works with any switch count
+- Qwen3-32B-FP8 (fp8 quantization) - works with any switch count
+- Mistral-Small-24B (bfloat16) - works with any switch count
+
+**Key Files**: `~/crash_isolation_results.md` (test results on RTX PRO 6000)
 
 ## vLLM Model Cleanup (CRITICAL)
 
@@ -562,3 +660,154 @@ def unload_llm(llm):
 ```
 
 **Key files**: `blitzinfer/orchestrator/standby_manager.py`, `test_standby_safe.py`
+
+## OpenAI-Compatible API Server (Jan 2026)
+
+**File**: `blitzinfer/api/server.py`
+
+FastAPI server providing OpenAI-compatible `/v1/chat/completions` endpoint with:
+- Multi-model support with fast switching
+- StandbyManager integration for prefetch
+- GPT-OSS-120B Harmony encoding support
+- Tool/function calling support
+
+### GPT-OSS-120B Harmony Encoding (CRITICAL)
+
+GPT-OSS-120B uses "Harmony" format for structured output with channels:
+- `<|channel|>analysis<|message|>` - Internal reasoning (hidden from user)
+- `<|channel|>final<|message|>` - User-visible response
+- `<|channel|>commentary to=functions.{name}<|message|>{args}` - Tool calls
+
+**Required imports**:
+```python
+from vllm.entrypoints.openai.parser.harmony_utils import (
+    parse_chat_output,
+    parse_chat_inputs_to_harmony_messages,
+    render_for_completion,
+    get_system_message,
+    get_developer_message,
+    parse_output_into_messages,
+    parse_output_message,
+)
+from openai.types.responses import ResponseFunctionToolCall
+```
+
+**Input encoding** (convert chat messages to Harmony tokens):
+```python
+# MUST use Harmony encoding for GPT-OSS input
+chat_msgs = [{"role": m.role, "content": m.content} for m in messages]
+sys_msg = get_system_message(with_custom_tools=has_tools)
+harmony_msgs = [sys_msg] + parse_chat_inputs_to_harmony_messages(chat_msgs)
+prompt_token_ids = render_for_completion(harmony_msgs)
+# Pass to vLLM as: llm.generate([{"prompt_token_ids": prompt_token_ids}], ...)
+```
+
+**Tool encoding** (CRITICAL - must use proper objects, not dicts):
+```python
+# WRONG - causes AttributeError: 'dict' object has no attribute 'type'
+tools_for_harmony = [{"type": "function", "function": {...}}]
+
+# CORRECT - use ChatCompletionToolsParam objects
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionToolsParam,
+    FunctionDefinition as VLLMFunctionDefinition,
+)
+tools_for_harmony = []
+for tool in request.tools:
+    func_def = VLLMFunctionDefinition(
+        name=tool.function.name,
+        description=tool.function.description,
+        parameters=tool.function.parameters,
+    )
+    tool_param = ChatCompletionToolsParam(type="function", function=func_def)
+    tools_for_harmony.append(tool_param)
+dev_msg = get_developer_message(tools=tools_for_harmony)
+```
+
+**Output parsing** (extract tool calls and final content):
+```python
+parser = parse_output_into_messages(list(output_token_ids))
+for msg in parser.messages:
+    response_items = parse_output_message(msg)
+    for item in response_items:
+        if isinstance(item, ResponseFunctionToolCall):
+            # Tool call: item.call_id, item.name, item.arguments
+            pass
+        elif item.type == "message":
+            # Final content: item.content[0].text
+            pass
+```
+
+**Stop tokens** (required for proper generation termination):
+```python
+from vllm.entrypoints.openai.parser.harmony_utils import get_stop_tokens_for_assistant_actions
+stop_tokens = get_stop_tokens_for_assistant_actions()  # Returns [200002, 200012]
+sampling_params = SamplingParams(..., stop_token_ids=stop_tokens)
+```
+
+**Token limits** (IMPORTANT):
+GPT-OSS outputs in Harmony format with reasoning (analysis channel) before the response (final channel). If `max_tokens` is too low, the model may be truncated mid-reasoning and never output the final channel:
+- `max_tokens=50` → Often truncated during reasoning, returns corrupted raw text
+- `max_tokens=200` → Usually sufficient for simple responses
+- For complex queries, use higher limits (500+)
+
+When the model is truncated (`finish_reason="length"`), `parse_chat_output()` may return `reasoning` content but no `final_content`. The server should handle this gracefully.
+
+**Conversation history corruption** (CRITICAL):
+If Harmony encoding fails (e.g., due to dict vs object issue), the raw output looks like:
+```
+assistantanalysisWe need to...assistantanalysis to=functions.bash code{"command":"ls"}
+```
+This is TEXT that LOOKS like Harmony but isn't properly tokenized. If this gets stored in client conversation history and sent back in subsequent requests, the model will imitate this pattern instead of generating proper Harmony tokens.
+
+**Fix**: Client must clear conversation history completely when this corruption occurs.
+
+### Model Compatibility
+
+| Model | Status | Notes |
+|-------|--------|-------|
+| gpt-oss-120b | ✅ Works | Requires Harmony encoding |
+| qwen3-vl-32b-thinking | ✅ Works | Vision model, 128K context max |
+| qwen3-32b | ✅ Works | Text model |
+| mistral-small-24b | ✅ Works | Text model |
+| llama-3.1-70b | ✅ Works | AWQ quantized |
+| kimi-vl | ✅ Works | Vision model, tested lucid |
+| glm-4.6v-awq | ✅ Works | Requires config fix (see below) |
+
+### GLM-4.6V-AWQ Config Fix (Jan 2026)
+
+The cyankiwi/GLM-4.6V-AWQ-4bit model has typos in its processor config files (`Glm46V` instead of `Glm4v`). Fix by editing the model's local cache:
+
+```python
+# Fix preprocessor_config.json and video_preprocessor_config.json
+import json, os
+
+model_path = os.path.expanduser(
+    '~/.cache/huggingface/hub/models--cyankiwi--GLM-4.6V-AWQ-4bit/snapshots/*'
+)
+# Use glob to find the actual path
+
+# Fix preprocessor_config.json
+preproc = json.load(open(f'{model_path}/preprocessor_config.json'))
+preproc['image_processor_type'] = 'Glm4vImageProcessor'  # was Glm46VImageProcessor
+preproc['processor_class'] = 'Glm4vProcessor'  # was Glm46VProcessor
+json.dump(preproc, open(f'{model_path}/preprocessor_config.json', 'w'), indent=2)
+
+# Fix video_preprocessor_config.json
+video_preproc = json.load(open(f'{model_path}/video_preprocessor_config.json'))
+video_preproc['video_processor_type'] = 'Glm4vVideoProcessor'  # was Glm46VVideoProcessor
+video_preproc['processor_class'] = 'Glm4vProcessor'  # was Glm46VProcessor
+json.dump(video_preproc, open(f'{model_path}/video_preprocessor_config.json', 'w'), indent=2)
+```
+
+After this fix, GLM-4.6V-AWQ loads and passes all lucidity tests (math, knowledge, self-awareness).
+
+### Non-Harmony Models
+
+For models other than GPT-OSS, skip Harmony encoding entirely:
+```python
+use_harmony = HAS_HARMONY and model_id == "gpt-oss-120b"
+if not use_harmony:
+    # Use standard chat template formatting
+    prompt = _format_chat_messages(request.messages)
+```
