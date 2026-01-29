@@ -28,6 +28,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Warm switches achieve <10s target for text models
 - Memory cleanup is stable (0.48GB drift over 3 switches)
 
+**Known issues:**
+- Tool calls from OpenCode (Claude Code) don't work with the API server
+- Harmony tool call parsing may need adjustment for external clients
+
 ## Completed
 
 - [x] vLLM compiled and working on AMD Radeon 780M (gfx1103) with ROCm 7.2
