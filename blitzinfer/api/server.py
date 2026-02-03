@@ -825,10 +825,9 @@ class ServerState:
 
             # Convert chat messages to Harmony format
             # parse_chat_input handles basic messages but not tool_calls or tool results
-            from sglang.srt.entrypoints.harmony_utils import (
-                Message as HarmonyMessage, Author, Role, TextContent,
-            )
             from openai.types.responses import ResponseFunctionToolCall as HarmonyToolCall
+            # Track tool calls so parse_response_input can look up call_id for tool results
+            prev_tool_calls: list[HarmonyToolCall] = []
             for msg in request.messages:
                 if msg.role == "tool" and msg.tool_call_id:
                     # Tool result message - convert to FunctionCallOutput
@@ -838,7 +837,7 @@ class ServerState:
                         call_id=msg.tool_call_id,
                         output=msg.content or "",
                     )
-                    harmony_msgs.append(parse_response_input(tool_output, []))
+                    harmony_msgs.append(parse_response_input(tool_output, prev_tool_calls))
                 elif msg.role == "assistant" and msg.tool_calls:
                     # Assistant message with tool calls
                     for tc in msg.tool_calls:
@@ -849,6 +848,7 @@ class ServerState:
                             name=tc.function.name,
                             arguments=tc.function.arguments,
                         )
+                        prev_tool_calls.append(tool_call)
                         harmony_msgs.append(parse_response_output(tool_call))
                 elif msg.content is not None:
                     harmony_msgs.append(parse_chat_input(msg))
