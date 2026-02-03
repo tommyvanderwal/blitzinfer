@@ -429,6 +429,12 @@ class ServerState:
         if model_info.quantization == "fp8":
             engine_kwargs["fp8_gemm_runner_backend"] = "triton"
 
+        # SM120 (Blackwell desktop): Vision encoder triton attention exceeds 99KB shared memory
+        # Use PyTorch's SDPA backend for vision encoder attention (safe on all CUDA devices)
+        # Decoder MLA attention is handled by patched triton block sizes in extend_attention.py
+        if model_info.supports_vision:
+            engine_kwargs["mm_attention_backend"] = "sdpa"
+
         # GPT-OSS needs Harmony tool call parser + triton_kernel for MXFP4 MoE
         if model_id == "gpt-oss-120b":
             engine_kwargs["tool_call_parser"] = "harmony"

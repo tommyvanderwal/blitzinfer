@@ -450,12 +450,11 @@ async def test_harmony(client: httpx.AsyncClient):
 # =============================================================================
 
 async def test_vision(client: httpx.AsyncClient):
-    """Vision tests with Kimi-VL (Qwen3-VL broken on SM120/Blackwell).
+    """Vision tests with Kimi-VL.
 
-    KNOWN ISSUE: Vision models crash on SM120/Blackwell desktop GPUs due to
-    triton attention kernel exceeding shared memory limit (106496 > 101376 bytes).
-    All vision tests with image input will fail on this hardware.
-    Text-only on vision model works.
+    SM120/Blackwell desktop GPUs (RTX PRO 6000, RTX 5090) are supported via:
+    - mm_attention_backend="sdpa" for vision encoder attention
+    - Patched triton block sizes in extend_attention.py for decoder MLA attention
     """
     print("\n=== VISION / MULTIMODAL ===")
 
