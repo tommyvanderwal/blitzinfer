@@ -5,6 +5,15 @@ from typing import Optional, Any
 
 
 @dataclass
+class QueueConfig:
+    """Configuration for per-model request queues."""
+    max_size: int = 64  # Max queued requests per model before 429
+    drain_timeout_seconds: float = 30.0  # Max time to wait for active queue to drain
+    switch_on_empty: bool = True  # Auto-switch when active queue drains
+    prefetch_on_enqueue: bool = True  # Start prefetch when request enters non-active queue
+
+
+@dataclass
 class PrefetchConfig:
     """Configuration for model prefetching system.
 
@@ -62,6 +71,9 @@ class BlitzInferConfig:
     # Standby settings (1 active + 1 standby model switching)
     standby_enabled: bool = True  # Enable standby slot for fast switching
     standby_arena_gb: float = 70.0  # Size of standby arena (must fit largest model)
+
+    # Queue settings (per-model request queues)
+    queue: QueueConfig = field(default_factory=QueueConfig)
 
     # Prefetch settings (legacy, for page cache / arena prefetch)
     prefetch: PrefetchConfig = field(default_factory=PrefetchConfig)
