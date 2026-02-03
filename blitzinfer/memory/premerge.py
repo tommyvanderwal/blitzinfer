@@ -312,6 +312,7 @@ def get_premerged_tensors_for_vllm(
     pinned_tensors: Dict[str, torch.Tensor],
     remove_merged_components: bool = True,
     pin_merged: bool = False,  # Changed default to False - arena tensors are already pinned
+    skip_merge: bool = True,  # CHANGED: Default True to avoid memory copies
 ) -> Dict[str, torch.Tensor]:
     """Get tensors ready for vLLM injection with pre-merged weights.
 
@@ -332,6 +333,11 @@ def get_premerged_tensors_for_vllm(
             memory usage. torch.cat on pinned tensors creates a contiguous
             copy that's already in pageable memory - GPU transfer is still
             fast from CPU RAM.
+        skip_merge: If True (default), skip torch.cat merging to avoid creating
+            large memory copies outside the arena. The pinned_loader will handle
+            merging on-the-fly during GPU transfer. This is critical for memory
+            efficiency - torch.cat creates new tensors that can easily exceed
+            available RAM when combined with the 80GB arena.
 
     Returns:
         Dict with tensors needed for vLLM (merged + non-merged).
@@ -424,6 +430,30 @@ def get_premerged_tensors_for_vllm(
             f"in {elapsed:.3f}s"
         )
         return dict(pinned_tensors)
+
+    # For ALL model formats: skip torch.cat merging by default to avoid memory copies
+    # The pinned_loader handles merging on-the-fly during GPU transfer
+    # This is CRITICAL for memory efficiency - torch.cat creates new tensors that
+    # can easily exceed available RAM (e.g., 16GB+ for Qwen-32B merged weights)
+    if skip_merge:
+        # Apply name normalization only
+        result = dict(pinned_tensors)
+        for name, tensor in list(result.items()):
+            norm_name = _normalize_for_vllm(name)
+            if norm_name not in result:
+                result[norm_name] = tensor
+
+        elapsed = time.perf_counter() - t0
+        unique_bytes = sum(t.numel() * t.element_size() for t in set(result.values()))
+        logger.info(
+            f"Pre-merge complete (skip_merge=True): {len(result)} tensors "
+            f"({unique_bytes / 1e9:.2f}GB unique) in {elapsed:.3f}s"
+        )
+        return result
+
+    # Legacy path: Actually merge tensors (creates memory copies!)
+    # Only used if skip_merge=False is explicitly passed
+    logger.warning("Using legacy torch.cat merge path - this creates large memory copies!")
 
     # Start with transformed tensors
     result = dict(pinned_tensors)
