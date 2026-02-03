@@ -34,7 +34,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # SGLang Engine (replaces vLLM)
-import sglang as sgl
+# Import Engine directly to avoid namespace conflict with local sglang/ source directory
+from sglang.srt.entrypoints.engine import Engine as SglEngine
 
 # Harmony utils from SGLang (native support, replaces ~300 lines of manual code)
 try:
@@ -46,6 +47,8 @@ try:
         parse_output_into_messages,
         parse_output_message,
         parse_chat_input,
+        parse_response_input,
+        parse_response_output,
     )
     from openai.types.responses import ResponseFunctionToolCall
     HAS_HARMONY = True
@@ -110,7 +113,7 @@ def crash_log(msg: str):
 class ModelInfo:
     name: str
     hf_path: str
-    context_length: int = 131072
+    context_length: Optional[int] = None  # None = auto-detect from model config
     mem_fraction_static: float = 0.88
     supports_vision: bool = False
     quantization: Optional[str] = None
@@ -123,47 +126,52 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
     "gpt-oss-120b": ModelInfo(
         name="gpt-oss-120b",
         hf_path="openai/gpt-oss-120b",
-        context_length=131072,
+        context_length=131072,  # GPT-OSS supports 128K natively
         mem_fraction_static=GPU_MEM_FRAC,
     ),
     "qwen3-vl-32b-thinking": ModelInfo(
         name="qwen3-vl-32b-thinking",
-        hf_path="Qwen/Qwen3-VL-32B-Thinking-FP8",
-        context_length=131072,
+        hf_path="Qwen/Qwen3-VL-32B-Instruct",
+        # WARNING: Both FP8 and bf16 Qwen3-VL produce garbage on SM120/Blackwell desktop GPUs.
+        # This is a SGLang + Qwen3-VL + SM120 compatibility bug (MROPE position embeddings).
+        # The model loads and runs but outputs are random tokens.
+        # Use kimi-vl as vision model alternative until this is fixed.
         mem_fraction_static=GPU_MEM_FRAC,
         supports_vision=True,
-        quantization="fp8",
     ),
     "qwen3-32b": ModelInfo(
         name="qwen3-32b",
         hf_path="Qwen/Qwen3-32B-FP8",
-        context_length=131072,
+        # Auto-detect context (model config has 40960)
         mem_fraction_static=GPU_MEM_FRAC,
         quantization="fp8",
     ),
     "mistral-small-24b": ModelInfo(
         name="mistral-small-24b",
         hf_path="mistralai/Mistral-Small-3.2-24B-Instruct-2506",
-        context_length=131072,
+        # WARNING: Mistral 3.2 is multimodal - needs preprocessor_config.json for image processor.
+        # Currently missing from local cache - will crash on load until downloaded.
+        # Also affected by vision SM120 shared memory limit.
         mem_fraction_static=GPU_MEM_FRAC,
+        supports_vision=True,
     ),
     "llama-3.1-70b": ModelInfo(
         name="llama-3.1-70b",
         hf_path="hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4",
-        context_length=131072,
+        context_length=131072,  # Llama 3.1 supports 128K
         mem_fraction_static=GPU_MEM_FRAC,
         quantization="awq",
     ),
     "qwen2.5-72b": ModelInfo(
         name="qwen2.5-72b",
         hf_path="Qwen/Qwen2.5-72B-Instruct",
-        context_length=131072,
+        context_length=131072,  # Qwen2.5 supports 128K
         mem_fraction_static=GPU_MEM_FRAC,
     ),
     "kimi-vl": ModelInfo(
         name="kimi-vl",
         hf_path="moonshotai/Kimi-VL-A3B-Thinking-2506",
-        context_length=131072,
+        # Auto-detect context from model config
         mem_fraction_static=GPU_MEM_FRAC,
         supports_vision=True,
     ),
@@ -337,7 +345,7 @@ class ServerState:
     """Global server state with per-model request queues."""
 
     def __init__(self):
-        self.engine: Optional[sgl.Engine] = None
+        self.engine: Optional[SglEngine] = None
         self.current_model: Optional[str] = None
         self.standby: Optional[StandbyManager] = None
         self.request_count: int = 0
@@ -401,23 +409,36 @@ class ServerState:
 
         engine_kwargs = {
             "model_path": model_info.hf_path,
-            "context_length": model_info.context_length,
             "mem_fraction_static": model_info.mem_fraction_static,
             "trust_remote_code": True,
-            "enforce_eager": True,
+            "disable_cuda_graph": True,  # SGLang equivalent of vLLM's enforce_eager
             "log_level": "info",
         }
+
+        # Only set context_length if explicitly configured (None = auto-detect from model config)
+        if model_info.context_length is not None:
+            engine_kwargs["context_length"] = model_info.context_length
 
         if model_info.quantization:
             engine_kwargs["quantization"] = model_info.quantization
 
-        # GPT-OSS needs Harmony tool call parser
+        # SM120 (Blackwell desktop: RTX PRO 6000, RTX 5090) compatibility:
+        # - DeepGemm FP8 kernels crash with "Unknown recipe" on SM120
+        # - Cutlass FP8 produces garbage on Qwen3-VL (works for non-VL)
+        # - Triton FP8 is the safest fallback for SM120
+        if model_info.quantization == "fp8":
+            engine_kwargs["fp8_gemm_runner_backend"] = "triton"
+
+        # GPT-OSS needs Harmony tool call parser + triton_kernel for MXFP4 MoE
         if model_id == "gpt-oss-120b":
             engine_kwargs["tool_call_parser"] = "harmony"
+            # triton_kernel keeps weights in native mxfp4 (no upcast to bf16)
+            # See: https://github.com/sgl-project/sglang/issues/13061
+            engine_kwargs["moe_runner_backend"] = "triton_kernel"
 
-        crash_log(f"_load_engine: sgl.Engine() starting")
-        self.engine = sgl.Engine(**engine_kwargs)
-        crash_log(f"_load_engine: sgl.Engine() done")
+        crash_log(f"_load_engine: SglEngine() starting")
+        self.engine = SglEngine(**engine_kwargs)
+        crash_log(f"_load_engine: SglEngine() done")
 
         self.current_model = model_id
         elapsed = time.time() - start
@@ -742,7 +763,11 @@ class ServerState:
                 finish_reason = "tool_calls"
 
         # Log response
-        preview = generated_text[:500] + "..." if len(generated_text) > 500 else generated_text
+        if generated_text:
+            preview = generated_text[:500] + "..." if len(generated_text) > 500 else generated_text
+        else:
+            generated_text = ""
+            preview = "(empty)"
         logger.info(f"[{request_id}] RESPONSE: {preview}")
 
         response_message = ResponseMessage(
@@ -784,10 +809,10 @@ class ServerState:
 
             # Developer message with tools
             if has_tools:
-                from openai.types.responses.tool import Tool
+                from openai.types.responses import FunctionTool
                 tools_for_harmony = []
                 for tool in request.tools:
-                    t = Tool(
+                    t = FunctionTool(
                         type="function",
                         name=tool.function.name,
                         description=tool.function.description or "",
@@ -799,23 +824,36 @@ class ServerState:
                 logger.info(f"[{request_id}] Added {len(request.tools)} tools to Harmony")
 
             # Convert chat messages to Harmony format
+            # parse_chat_input handles basic messages but not tool_calls or tool results
+            from sglang.srt.entrypoints.harmony_utils import (
+                Message as HarmonyMessage, Author, Role, TextContent,
+            )
+            from openai.types.responses import ResponseFunctionToolCall as HarmonyToolCall
             for msg in request.messages:
-                msg_dict = {"role": msg.role, "content": msg.content or ""}
-                if msg.tool_calls:
-                    msg_dict["tool_calls"] = [
-                        {
-                            "id": tc.id,
-                            "type": tc.type,
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in msg.tool_calls
-                    ]
-                if msg.tool_call_id:
-                    msg_dict["tool_call_id"] = msg.tool_call_id
-                harmony_msgs.append(parse_chat_input(msg_dict))
+                if msg.role == "tool" and msg.tool_call_id:
+                    # Tool result message - convert to FunctionCallOutput
+                    from openai.types.responses.response_input_item_param import FunctionCallOutput
+                    tool_output = FunctionCallOutput(
+                        type="function_call_output",
+                        call_id=msg.tool_call_id,
+                        output=msg.content or "",
+                    )
+                    harmony_msgs.append(parse_response_input(tool_output, []))
+                elif msg.role == "assistant" and msg.tool_calls:
+                    # Assistant message with tool calls
+                    for tc in msg.tool_calls:
+                        tool_call = HarmonyToolCall(
+                            id=tc.id,
+                            type="function_call",
+                            call_id=tc.id,
+                            name=tc.function.name,
+                            arguments=tc.function.arguments,
+                        )
+                        harmony_msgs.append(parse_response_output(tool_call))
+                elif msg.content is not None:
+                    harmony_msgs.append(parse_chat_input(msg))
+                else:
+                    logger.debug(f"[{request_id}] Skipping msg role={msg.role} (content=None)")
 
             input_ids = render_for_completion(harmony_msgs)
             logger.debug(f"[{request_id}] Harmony prompt: {len(input_ids)} tokens")
