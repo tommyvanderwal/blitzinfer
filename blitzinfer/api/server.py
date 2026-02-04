@@ -434,8 +434,10 @@ class ServerState:
         if model_id == "gpt-oss-120b":
             engine_kwargs["tool_call_parser"] = "harmony"
             # triton_kernel keeps weights in native mxfp4 (no upcast to bf16)
-            # See: https://github.com/sgl-project/sglang/issues/13061
             engine_kwargs["moe_runner_backend"] = "triton_kernel"
+            # gpt-oss config has torch_dtype=float32, auto-downcasts to float16,
+            # but triton MoE kernels require bfloat16 hidden states
+            engine_kwargs["dtype"] = "bfloat16"
 
         # Apply any model-specific extra args
         if model_info.extra_args:
@@ -501,6 +503,9 @@ class ServerState:
             overrides["fp8_gemm_runner_backend"] = "triton"
         if model_id == "gpt-oss-120b":
             overrides["moe_runner_backend"] = "triton_kernel"
+            # gpt-oss config has torch_dtype=float32, which auto-downcasts to
+            # float16, but triton MoE kernels require bfloat16 hidden states.
+            overrides["dtype"] = "bfloat16"
         return overrides
 
     async def _switch_model(self, target_model: str):
@@ -522,13 +527,9 @@ class ServerState:
         target_info = AVAILABLE_MODELS[target_model]
 
         # Try fast in-process reload first.
-        # Skip for gpt-oss-120b (MXFP4 weight processing needs ~95GB VRAM,
-        # reload can't free enough memory within the same process).
-        skip_reload = (
-            self.current_model == "gpt-oss-120b" or
-            target_model == "gpt-oss-120b"
-        )
-        if self.engine is not None and not skip_reload:
+        # Previously skipped for gpt-oss-120b due to mxfp4 bf16 upcast OOM,
+        # but now fixed by using triton_kernels backend (keeps weights in mxfp4).
+        if self.engine is not None:
             reload_success = await self._try_reload_model(target_model, target_info)
             if reload_success:
                 self.current_model = target_model
