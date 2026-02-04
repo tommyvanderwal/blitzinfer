@@ -129,32 +129,25 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
         context_length=131072,  # GPT-OSS supports 128K natively
         mem_fraction_static=GPU_MEM_FRAC,
     ),
-    "qwen3-vl-32b-thinking": ModelInfo(
-        name="qwen3-vl-32b-thinking",
-        hf_path="Qwen/Qwen3-VL-32B-Instruct",
-        # WARNING: Both FP8 and bf16 Qwen3-VL produce garbage on SM120/Blackwell desktop GPUs.
-        # This is a SGLang + Qwen3-VL + SM120 compatibility bug (MROPE position embeddings).
-        # The model loads and runs but outputs are random tokens.
-        # Use kimi-vl as vision model alternative until this is fixed.
-        mem_fraction_static=GPU_MEM_FRAC,
-        supports_vision=True,
-    ),
+    # NOTE: Qwen3-VL-32B produces garbage on SM120/Blackwell desktop GPUs
+    # (MROPE position embedding bug). Use kimi-vl for vision instead.
+    # Keeping entry commented out until SGLang fixes MROPE for SM120.
+    # "qwen3-vl-32b-thinking": ModelInfo(
+    #     name="qwen3-vl-32b-thinking",
+    #     hf_path="Qwen/Qwen3-VL-32B-Thinking-FP8",
+    #     mem_fraction_static=GPU_MEM_FRAC,
+    #     supports_vision=True,
+    #     quantization="fp8",
+    # ),
     "qwen3-32b": ModelInfo(
         name="qwen3-32b",
-        hf_path="Qwen/Qwen3-32B-FP8",
-        # Auto-detect context (model config has 40960)
+        hf_path="Qwen/Qwen3-32B",
+        # bf16 - FP8 not supported on SM120/Blackwell (deep_gemm + flashinfer both fail)
         mem_fraction_static=GPU_MEM_FRAC,
-        quantization="fp8",
     ),
-    "mistral-small-24b": ModelInfo(
-        name="mistral-small-24b",
-        hf_path="mistralai/Mistral-Small-3.2-24B-Instruct-2506",
-        # WARNING: Mistral 3.2 is multimodal - needs preprocessor_config.json for image processor.
-        # Currently missing from local cache - will crash on load until downloaded.
-        # Also affected by vision SM120 shared memory limit.
-        mem_fraction_static=GPU_MEM_FRAC,
-        supports_vision=True,
-    ),
+    # NOTE: Mistral-Small-3.2 dropped - non-standard tokenizer (MistralCommonTokenizer),
+    # non-standard weight format (consolidated.safetensors), no preprocessor_config.json.
+    # Would need 3 separate workarounds. Not worth it until Mistral fixes their HF integration.
     "llama-3.1-70b": ModelInfo(
         name="llama-3.1-70b",
         hf_path="hugging-quants/Meta-Llama-3.1-70B-Instruct-AWQ-INT4",
@@ -162,10 +155,11 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
         mem_fraction_static=GPU_MEM_FRAC,
         quantization="awq",
     ),
-    "qwen2.5-72b": ModelInfo(
-        name="qwen2.5-72b",
-        hf_path="Qwen/Qwen2.5-72B-Instruct",
-        context_length=131072,  # Qwen2.5 supports 128K
+    # NOTE: GLM-4.6V-AWQ requires transformers >= 5.0, incompatible with SGLang.
+    # Qwen2.5-72B weights not downloaded.
+    "qwen2.5-7b": ModelInfo(
+        name="qwen2.5-7b",
+        hf_path="Qwen/Qwen2.5-7B-Instruct",
         mem_fraction_static=GPU_MEM_FRAC,
     ),
     "kimi-vl": ModelInfo(
@@ -179,9 +173,9 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
 
 MODEL_ALIASES = {
     "gpt-oss": "gpt-oss-120b",
-    "qwen-vl": "qwen3-vl-32b-thinking",
+    "qwen-vl": "kimi-vl",  # Qwen3-VL broken on SM120, use kimi-vl instead
     "qwen": "qwen3-32b",
-    "mistral": "mistral-small-24b",
+    "qwen-small": "qwen2.5-7b",
     "llama": "llama-3.1-70b",
     "kimi": "kimi-vl",
 }
@@ -412,6 +406,7 @@ class ServerState:
             "mem_fraction_static": model_info.mem_fraction_static,
             "trust_remote_code": True,
             "disable_cuda_graph": True,  # SGLang equivalent of vLLM's enforce_eager
+            "attention_backend": "triton",  # SM120 (Blackwell desktop): flashinfer not supported
             "log_level": "info",
         }
 
@@ -441,6 +436,10 @@ class ServerState:
             # triton_kernel keeps weights in native mxfp4 (no upcast to bf16)
             # See: https://github.com/sgl-project/sglang/issues/13061
             engine_kwargs["moe_runner_backend"] = "triton_kernel"
+
+        # Apply any model-specific extra args
+        if model_info.extra_args:
+            engine_kwargs.update(model_info.extra_args)
 
         crash_log(f"_load_engine: SglEngine() starting")
         self.engine = SglEngine(**engine_kwargs)
@@ -1018,38 +1017,26 @@ class ServerState:
                 gen_kwargs["stream"] = True
                 generator = await self.engine.async_generate(**gen_kwargs)
 
-                async for chunk in generator:
-                    chunk_text = chunk.get("text", "")
-                    # SGLang streaming returns cumulative text, extract delta
-                    delta = chunk_text[len(prev_text):]
-                    prev_text = chunk_text
+                if use_harmony:
+                    # Harmony models: buffer entire output, parse channels, then emit
+                    # This avoids leaking "analysis" (reasoning) channel to the client
+                    last_chunk = None
+                    async for chunk in generator:
+                        last_chunk = chunk
 
-                    if not delta:
-                        continue
+                    if last_chunk:
+                        output_ids = last_chunk.get("output_ids", [])
+                        meta = last_chunk.get("meta_info", {})
+                        finish_info = meta.get("finish_reason", {})
+                        finish = finish_info.get("type", "stop") if isinstance(finish_info, dict) else "stop"
 
-                    data = {
-                        "id": f"chatcmpl-{request_id}",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": delta},
-                            "finish_reason": None,
-                        }],
-                    }
-                    yield f"data: {json.dumps(data)}\n\n"
+                        final_text = ""
+                        tool_calls = []
+                        if output_ids:
+                            final_text, tool_calls = self._parse_harmony_output(
+                                output_ids, request_id, has_tools
+                            )
 
-                # Final chunk
-                meta = chunk.get("meta_info", {}) if chunk else {}
-                finish_info = meta.get("finish_reason", {})
-                finish = finish_info.get("type", "stop") if isinstance(finish_info, dict) else "stop"
-
-                # For Harmony + tools, parse the complete output for tool calls
-                if use_harmony and has_tools:
-                    output_ids = chunk.get("output_ids", []) if chunk else []
-                    if output_ids:
-                        _, tool_calls = self._parse_harmony_output(output_ids, request_id, True)
                         if tool_calls:
                             finish = "tool_calls"
                             for i, tc in enumerate(tool_calls):
@@ -1075,6 +1062,65 @@ class ServerState:
                                     }],
                                 }
                                 yield f"data: {json.dumps(tc_data)}\n\n"
+                        elif final_text:
+                            # Emit parsed final content as a single chunk
+                            data = {
+                                "id": f"chatcmpl-{request_id}",
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": final_text},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                        else:
+                            # Fallback: emit raw text if Harmony parsing returned nothing
+                            raw = last_chunk.get("text", "")
+                            if raw:
+                                data = {
+                                    "id": f"chatcmpl-{request_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": raw},
+                                        "finish_reason": None,
+                                    }],
+                                }
+                                yield f"data: {json.dumps(data)}\n\n"
+                else:
+                    # Non-Harmony models: stream deltas in real-time
+                    async for chunk in generator:
+                        chunk_text = chunk.get("text", "")
+                        # SGLang streaming returns cumulative text, extract delta
+                        delta = chunk_text[len(prev_text):]
+                        prev_text = chunk_text
+
+                        if not delta:
+                            continue
+
+                        data = {
+                            "id": f"chatcmpl-{request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": delta},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+
+                # Final chunk with finish_reason
+                if not use_harmony:
+                    meta = chunk.get("meta_info", {}) if chunk else {}
+                    finish_info = meta.get("finish_reason", {})
+                    finish = finish_info.get("type", "stop") if isinstance(finish_info, dict) else "stop"
 
                 final_data = {
                     "id": f"chatcmpl-{request_id}",
