@@ -490,8 +490,25 @@ class ServerState:
         crash_log(f"_shutdown_engine: freed ~{freed:.1f}GB GPU")
         logger.info(f"Engine shutdown complete, freed ~{freed:.1f}GB GPU")
 
+    def _build_reload_overrides(self, model_id: str, model_info: ModelInfo) -> Dict[str, Any]:
+        """Build server_args overrides dict for reload_model()."""
+        overrides = {}
+        if model_info.context_length is not None:
+            overrides["context_length"] = model_info.context_length
+        if model_info.quantization:
+            overrides["quantization"] = model_info.quantization
+        if model_info.quantization == "fp8":
+            overrides["fp8_gemm_runner_backend"] = "triton"
+        if model_id == "gpt-oss-120b":
+            overrides["moe_runner_backend"] = "triton_kernel"
+        return overrides
+
     async def _switch_model(self, target_model: str):
-        """Switch to a different model (called from queue processor)."""
+        """Switch to a different model (called from queue processor).
+
+        Uses Engine.reload_model() for fast in-process switching (~4-10s warm).
+        Falls back to full Engine restart if reload fails.
+        """
         if self.current_model == target_model:
             return
 
@@ -502,6 +519,21 @@ class ServerState:
         logger.info("=" * 60)
 
         start = time.time()
+        target_info = AVAILABLE_MODELS[target_model]
+
+        # Try fast in-process reload first
+        if self.engine is not None:
+            reload_success = await self._try_reload_model(target_model, target_info)
+            if reload_success:
+                self.current_model = target_model
+                log_memory_state("AFTER_SWITCH")
+                elapsed = time.time() - start
+                crash_log(f"=== SWITCH #{self.switch_count} COMPLETE (reload) in {elapsed:.1f}s ===")
+                logger.info(f"Switch complete via reload_model in {elapsed:.1f}s")
+                return
+
+        # Fallback: full Engine restart
+        logger.info("Using full Engine restart (fallback)")
 
         # Wait for standby prefetch if running
         standby_state = self.standby.get_state()
@@ -509,27 +541,62 @@ class ServerState:
             logger.info("Waiting for background prefetch...")
             self.standby.wait_for_load(timeout=120.0)
 
-        # Shutdown current engine
         await self._shutdown_engine()
 
-        # Verify memory
         mem_ok, mem_msg = verify_memory_available(min_gpu_free_gb=5.0, min_ram_avail_gb=2.0)
         if not mem_ok:
             raise MemoryError(f"Insufficient memory to load {target_model}: {mem_msg}")
 
-        # Load new engine
         await self._load_engine(target_model)
 
         log_memory_state("AFTER_SWITCH")
         elapsed = time.time() - start
-        crash_log(f"=== SWITCH #{self.switch_count} COMPLETE in {elapsed:.1f}s ===")
-        logger.info(f"Switch complete in {elapsed:.1f}s")
+        crash_log(f"=== SWITCH #{self.switch_count} COMPLETE (restart) in {elapsed:.1f}s ===")
+        logger.info(f"Switch complete via Engine restart in {elapsed:.1f}s")
 
-        # Start prefetching previous model
-        if self.current_model:
-            prev_info = AVAILABLE_MODELS.get(self.current_model)
-            if prev_info:
-                self.standby.start_prefetch(prev_info.hf_path)
+    async def _try_reload_model(self, target_model: str, target_info: ModelInfo) -> bool:
+        """Attempt fast in-process model reload. Returns True on success."""
+        from sglang.srt.managers.io_struct import ReloadModelReqInput
+
+        overrides = self._build_reload_overrides(target_model, target_info)
+        logger.info(f"Attempting reload_model: {self.current_model} -> {target_model} "
+                    f"(overrides={overrides})")
+
+        try:
+            # Call tokenizer_manager directly (async) to avoid
+            # Engine.reload_model()'s run_until_complete which conflicts
+            # with the already-running FastAPI event loop.
+            obj = ReloadModelReqInput(
+                model_path=target_info.hf_path,
+                server_args_overrides=overrides,
+                flush_cache=True,
+            )
+            success, message = await self.engine.tokenizer_manager.reload_model(
+                obj, None
+            )
+
+            if success:
+                # Reload tokenizer in the main process (mirrors Engine.reload_model)
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+                    self.engine.tokenizer_manager.tokenizer = get_tokenizer(
+                        target_info.hf_path,
+                        tokenizer_mode=self.engine.server_args.tokenizer_mode,
+                        trust_remote_code=self.engine.server_args.trust_remote_code,
+                    )
+                except Exception as e:
+                    logger.warning(f"Tokenizer reload in server (non-fatal): {e}")
+
+                logger.info(f"reload_model succeeded: {message}")
+                return True
+            else:
+                logger.warning(f"reload_model failed: {message}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"reload_model exception: {e}")
+            logger.warning(traceback.format_exc())
+            return False
 
     def _find_next_model(self) -> Optional[str]:
         """Find the next model that has queued requests.
