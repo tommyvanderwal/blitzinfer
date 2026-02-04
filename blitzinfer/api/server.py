@@ -521,8 +521,14 @@ class ServerState:
         start = time.time()
         target_info = AVAILABLE_MODELS[target_model]
 
-        # Try fast in-process reload first
-        if self.engine is not None:
+        # Try fast in-process reload first.
+        # Skip for gpt-oss-120b (MXFP4 weight processing needs ~95GB VRAM,
+        # reload can't free enough memory within the same process).
+        skip_reload = (
+            self.current_model == "gpt-oss-120b" or
+            target_model == "gpt-oss-120b"
+        )
+        if self.engine is not None and not skip_reload:
             reload_success = await self._try_reload_model(target_model, target_info)
             if reload_success:
                 self.current_model = target_model
