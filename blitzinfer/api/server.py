@@ -430,13 +430,14 @@ class ServerState:
         if model_info.supports_vision:
             engine_kwargs["mm_attention_backend"] = "sdpa"
 
-        # GPT-OSS needs Harmony tool call parser + triton_kernel for MXFP4 MoE
+        # GPT-OSS needs Harmony tool call parser and correct MoE backend for MXFP4
         if model_id == "gpt-oss-120b":
             engine_kwargs["tool_call_parser"] = "harmony"
-            # triton_kernel keeps weights in native mxfp4 (no upcast to bf16)
+            # All Blackwell variants (SM100, SM120) use triton_kernel with optimized constraints
+            # SM120 (RTX PRO 6000) has specific opt_flags in mxfp4.py to fit shared memory
             engine_kwargs["moe_runner_backend"] = "triton_kernel"
             # gpt-oss config has torch_dtype=float32, auto-downcasts to float16,
-            # but triton MoE kernels require bfloat16 hidden states
+            # but MoE kernels require bfloat16 hidden states
             engine_kwargs["dtype"] = "bfloat16"
 
         # Apply any model-specific extra args
@@ -502,9 +503,10 @@ class ServerState:
         if model_info.quantization == "fp8":
             overrides["fp8_gemm_runner_backend"] = "triton"
         if model_id == "gpt-oss-120b":
+            # All Blackwell variants (SM100, SM120) use triton_kernel with optimized constraints
             overrides["moe_runner_backend"] = "triton_kernel"
             # gpt-oss config has torch_dtype=float32, which auto-downcasts to
-            # float16, but triton MoE kernels require bfloat16 hidden states.
+            # float16, but MoE kernels require bfloat16 hidden states.
             overrides["dtype"] = "bfloat16"
         return overrides
 
