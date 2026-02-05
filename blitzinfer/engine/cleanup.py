@@ -25,6 +25,83 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _walk_and_free_cuda_tensors(root, max_depth: int = 12) -> int:
+    """Recursively walk an object graph and resize ALL CUDA tensor storages to 0.
+
+    This is critical for MXFP4 models where the Triton backend stores weights in
+    custom wrapper objects (Tensor → Storage → torch.Tensor) that are NOT registered
+    as nn.Parameters or buffers. named_parameters() and named_buffers() miss these.
+
+    The walker handles:
+    - torch.Tensor directly on CUDA
+    - Triton Tensor wrappers (storage.data is a torch.Tensor)
+    - PrecisionConfig/FlexCtx dataclasses with nested tensors
+    - nn.Module children and attributes
+    - Lists, tuples, dicts
+    - Any object with __dict__
+
+    Returns:
+        Number of CUDA tensors freed.
+    """
+    freed = 0
+    visited = set()
+
+    def _visit(obj, depth):
+        nonlocal freed
+        if depth > max_depth:
+            return
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        # Direct torch.Tensor on CUDA - resize its storage
+        if isinstance(obj, torch.Tensor):
+            try:
+                if obj.device.type == 'cuda' and obj.storage().size() > 0:
+                    obj.data.storage().resize_(0)
+                    freed += 1
+            except Exception:
+                pass
+            return
+
+        # nn.Module - walk children, parameters, buffers, and all attributes
+        if isinstance(obj, torch.nn.Module):
+            for child in obj.children():
+                _visit(child, depth + 1)
+            # Walk ALL instance attributes (catches quant_method, MoE internals, etc.)
+            for attr_val in vars(obj).values():
+                _visit(attr_val, depth + 1)
+            return
+
+        # Lists and tuples
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                _visit(item, depth + 1)
+            return
+
+        # Dicts
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _visit(v, depth + 1)
+            return
+
+        # Skip primitive types, strings, and types themselves
+        if isinstance(obj, (int, float, str, bytes, bool, type, type(None))):
+            return
+
+        # Generic objects with __dict__ (covers dataclasses like Triton Tensor,
+        # Storage, PrecisionConfig, FlexCtx, etc.)
+        obj_dict = getattr(obj, '__dict__', None)
+        if obj_dict is not None:
+            for attr_val in obj_dict.values():
+                _visit(attr_val, depth + 1)
+
+    _visit(root, 0)
+    return freed
+
+
 def cleanup_vllm_model(llm) -> float:
     """Aggressively clean up a vLLM LLM instance and release GPU memory.
 
@@ -87,18 +164,16 @@ def cleanup_vllm_model(llm) -> float:
                     if kv is not None:
                         if isinstance(kv, torch.Tensor):
                             try:
-                                # This actually frees the GPU memory
                                 kv.storage().resize_(0)
                             except Exception:
-                                # Fallback to data replacement
-                                kv.data = torch.empty(0, device='cpu')
+                                pass
                         elif isinstance(kv, (list, tuple)):
                             for t in kv:
                                 if isinstance(t, torch.Tensor):
                                     try:
                                         t.storage().resize_(0)
                                     except Exception:
-                                        t.data = torch.empty(0, device='cpu')
+                                        pass
                 kv_caches.clear()
                 logger.debug("Cleared model_runner.kv_caches")
 
@@ -114,7 +189,7 @@ def cleanup_vllm_model(llm) -> float:
                                 try:
                                     kv.storage().resize_(0)
                                 except Exception:
-                                    kv.data = torch.empty(0, device='cpu')
+                                    pass
                         layer.kv_cache = []
                 ctx.clear()
                 logger.debug("Cleared static_forward_context")
@@ -134,27 +209,35 @@ def cleanup_vllm_model(llm) -> float:
                 model_runner.encoder_cache = None
                 logger.debug("Cleared encoder_cache")
 
-        # Clear model parameters - use storage().resize_(0) for complete release
+        # Walk the ENTIRE model object graph to find and free ALL CUDA tensors.
+        # This catches tensors that named_parameters()/named_buffers() miss:
+        # - MXFP4 Triton backend: Tensor→Storage→torch.Tensor wrappers
+        #   stored on Mxfp4MoEMethod (self.w13_weight, self.w2_weight)
+        # - PrecisionConfig.weight_scale (Triton Tensor with CUDA data)
+        # - Any other quantization method's internal CUDA state
         if model is not None:
-            for name, param in list(model.named_parameters()):
-                if param.device.type == 'cuda':
-                    try:
-                        param.data.storage().resize_(0)
-                    except Exception:
-                        param.data = torch.empty(0, device='cpu')
-            logger.debug("Cleared model parameters")
+            # CRITICAL: Clear compilation_config.static_forward_context BEFORE walking.
+            # This dict maps layer names to ALL FusedMoE modules. It's a shared reference
+            # accessible from every FusedMoE layer's vllm_config attribute. When the walker
+            # visits layer 0 and traverses vllm_config, it finds all 36 layers at depth ~9,
+            # adding them to the visited set. Later, layers 1-35 via model.layers (depth ~5)
+            # are skipped as already-visited. Through vllm_config, MXFP4 data tensors end up
+            # at depth ~13 (beyond max_depth=12) and never get freed. Clearing this dict
+            # forces the walker to visit each layer only through model.layers (depth ~5),
+            # giving enough depth budget to reach Tensor→Storage→data at depth ~9.
+            for module in model.modules():
+                vc = getattr(module, 'vllm_config', None)
+                if vc is not None:
+                    cc = getattr(vc, 'compilation_config', None)
+                    if cc is not None:
+                        sfc = getattr(cc, 'static_forward_context', None)
+                        if sfc is not None and isinstance(sfc, dict) and len(sfc) > 0:
+                            sfc.clear()
+                            logger.debug("Cleared compilation_config.static_forward_context")
+                            break  # Shared config, only need to clear once
 
-            # Also clear buffers
-            for name, buf in list(model.named_buffers()):
-                if buf.device.type == 'cuda':
-                    try:
-                        buf.storage().resize_(0)
-                    except Exception:
-                        try:
-                            buf.data = torch.empty(0, device='cpu')
-                        except Exception:
-                            pass
-            logger.debug("Cleared model buffers")
+            n_freed = _walk_and_free_cuda_tensors(model)
+            logger.debug(f"Model graph walk: freed {n_freed} CUDA tensors")
 
             # Delete model reference
             del model
@@ -198,10 +281,11 @@ def cleanup_vllm_model(llm) -> float:
     # Delete the LLM object
     del llm
 
-    # Force multiple rounds of garbage collection with explicit cache clearing between rounds
-    for i in range(5):
-        gc.collect()
-        torch.cuda.empty_cache()
+    # Garbage collect to release Python references, then free cached CUDA memory
+    gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Synchronize and clear
     torch.cuda.synchronize()
@@ -211,33 +295,22 @@ def cleanup_vllm_model(llm) -> float:
     torch.cuda.reset_accumulated_memory_stats()
 
     # Try to release PyTorch's CUDA caching allocator memory
-    # This can help with fragmentation
     try:
-        # Force all cached memory to be released
         torch.cuda.memory._set_allocator_settings("garbage_collection_threshold:0.0")
         gc.collect()
         torch.cuda.empty_cache()
     except Exception as e:
         logger.debug(f"Could not adjust allocator settings: {e}")
 
-    # Try to trim the memory allocator's cached blocks
+    # Force synchronization and cleanup
     try:
-        # This function releases all unused cached memory from the allocator
-        # so that those can be used in other GPU applications
-        torch.cuda.memory._cuda_caching_allocator_raw_delete(torch.cuda.current_device())
-    except Exception as e:
-        logger.debug(f"Could not delete raw allocator: {e}")
-
-    # Another approach: use memory snapshots to find leaked tensors
-    try:
-        # Force synchronization and cleanup
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()  # Collect IPC memory
+        torch.cuda.ipc_collect()
     except Exception as e:
         logger.debug(f"Could not run ipc_collect: {e}")
 
-    # Reset allocator settings to a more aggressive GC threshold
+    # Restore reasonable GC threshold
     try:
         torch.cuda.memory._set_allocator_settings("garbage_collection_threshold:0.6")
     except Exception:
@@ -589,12 +662,6 @@ def clear_cudnn_cublas_workspaces():
         # Force CUDA sync to release workspaces
         torch.cuda.synchronize()
 
-        # Trigger cuBLAS workspace release with a small matmul
-        a = torch.randn(1, 1, device='cuda')
-        b = torch.randn(1, 1, device='cuda')
-        _ = torch.mm(a, b)
-        del a, b, _
-
         logger.debug("Reset cuDNN/cuBLAS workspaces")
     except Exception as e:
         logger.debug(f"cuDNN/cuBLAS clear: {e}")
@@ -709,10 +776,8 @@ def aggressive_allocator_cleanup():
         # Set aggressive GC threshold
         torch.cuda.memory._set_allocator_settings("garbage_collection_threshold:0.0")
 
-        # Multiple rounds of collection
-        for _ in range(3):
-            gc.collect()
-            torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Collect IPC memory
         torch.cuda.ipc_collect()
@@ -868,15 +933,79 @@ def clear_fla_module_caches():
         logger.debug(f"Cleared {caches_cleared} FLA tensor_cache closures")
 
 
+def detach_all_cuda_tensors() -> int:
+    """Detach ALL Python-side CUDA tensor references before force_free.
+
+    Walks gc.get_objects() to find every torch.Tensor on CUDA and resizes
+    its storage to 0. This safely detaches the Python object from the CUDA
+    address, preventing "invalid device pointer" crashes at exit when:
+    1. force_free_all_allocated_blocks() frees the CUDA memory
+    2. Python later destructs tensor objects during shutdown that still
+       point to the now-freed CUDA addresses
+
+    CRITICAL: Must be called BEFORE force_free_all_allocated_blocks().
+    """
+    detached = 0
+    for obj in gc.get_objects():
+        if isinstance(obj, torch.Tensor):
+            try:
+                if obj.device.type == 'cuda' and obj.storage().size() > 0:
+                    obj.data.storage().resize_(0)
+                    detached += 1
+            except Exception:
+                pass
+    if detached:
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.debug(f"Detached {detached} CUDA tensors before force_free")
+    return detached
+
+
+def _log_remaining_allocated_blocks():
+    """Log any remaining allocated CUDA blocks for monitoring.
+
+    After the model walker + detach_all_cuda_tensors + gc + empty_cache,
+    any remaining 'active_allocated' blocks are C++ internal allocations
+    (cuBLAS workspaces, Flash Attention buffers, NCCL, etc.) that are
+    managed by their owning libraries. We log them for monitoring but
+    do NOT force-free them - doing so causes "invalid device pointer"
+    crashes at exit when C++ TensorImpl destructors try to free the
+    already-deleted addresses.
+    """
+    try:
+        snapshot = torch.cuda.memory._snapshot()
+        segments = snapshot.get('segments', [])
+
+        total_remaining = 0
+        block_count = 0
+
+        for seg in segments:
+            for block in seg.get('blocks', []):
+                if block.get('state') == 'active_allocated':
+                    total_remaining += block.get('size', 0)
+                    block_count += 1
+
+        if block_count > 0:
+            remaining_gb = total_remaining / 1024**3
+            logger.debug(
+                f"Remaining C++ allocated blocks: {block_count} "
+                f"({remaining_gb:.2f}GB) - left for library cleanup"
+            )
+    except Exception:
+        pass
+
+
 def force_free_all_allocated_blocks() -> tuple[int, float]:
     """Force-free ALL remaining allocated blocks using caching_allocator_delete.
 
-    This is essential for freeing MXFP4 quantization memory which uses opaque
-    CUDA allocations that can't be freed via normal tensor operations.
+    IMPORTANT: This should only be called AFTER:
+    1. _walk_and_free_cuda_tensors() has resized all model tensor storages to 0
+    2. detach_all_cuda_tensors() has resized all gc-visible tensor storages to 0
+    3. gc.collect() + empty_cache() has released those blocks
 
-    IMPORTANT: Only call this AFTER all Python references to GPU tensors have
-    been deleted and all vLLM/model code has been shut down. Calling this while
-    C++ code still holds references will cause crashes.
+    After those steps, any remaining 'active_allocated' blocks are truly orphaned
+    C++ allocations with NO Python TensorImpl references. force_free is safe because
+    there's no Python destructor that will try to double-free these addresses.
 
     Returns:
         Tuple of (blocks_deleted, bytes_deleted_gb)
@@ -892,16 +1021,14 @@ def force_free_all_allocated_blocks() -> tuple[int, float]:
             blocks = seg.get('blocks', [])
             for block in blocks:
                 if block.get('state') == 'active_allocated':
-                    # Try both 'addr' and 'address' keys
-                    addr = block.get('addr', block.get('address', 0))
                     size = block.get('size', 0)
+                    addr = block.get('addr', block.get('address', 0))
                     if addr:
                         try:
                             torch.cuda.caching_allocator_delete(addr)
                             blocks_deleted += 1
                             bytes_deleted += size
                         except Exception:
-                            # Block may already be freed or invalid
                             pass
 
         # Clean up after force deletion
@@ -1010,22 +1137,33 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
     # with "invalid device pointer".
     clear_fla_module_caches()
 
-    # Force-free ALL remaining allocated blocks
-    # This is essential for MXFP4 models which have opaque CUDA allocations
-    # that can't be freed via normal tensor operations
-    if force_free:
-        # CRITICAL: Clear cuBLAS workspaces BEFORE force-freeing blocks!
-        # cuBLAS holds internal pointers to workspace memory. If we force-free
-        # those blocks first, then call clearCublasWorkspaces, it crashes with
-        # "invalid device pointer" because cuBLAS tries to access freed memory.
-        try:
-            torch._C._cuda_clearCublasWorkspaces()
-            logger.debug("Cleared cuBLAS workspaces before force-free")
-        except Exception as e:
-            logger.debug(f"_cuda_clearCublasWorkspaces: {e}")
+    # Clear cuBLAS workspaces - these hold internal pointers to CUDA memory
+    try:
+        torch._C._cuda_clearCublasWorkspaces()
+        logger.debug("Cleared cuBLAS workspaces")
+    except Exception as e:
+        logger.debug(f"_cuda_clearCublasWorkspaces: {e}")
 
-        # Now safe to force-free all remaining blocks
-        force_free_all_allocated_blocks()
+    # Detach ALL remaining Python CUDA tensors as a safety net.
+    # The model walker catches most tensors, but this handles any stray
+    # tensors in global variables, closures, or caches.
+    # storage().resize_(0) is safe - it properly updates the DataPtr.
+    detach_all_cuda_tensors()
+
+    if force_free:
+        # Log remaining allocated blocks for monitoring, but do NOT
+        # force-free them with caching_allocator_delete(). These are
+        # C++ internal allocations (cuBLAS workspaces, Flash Attention
+        # buffers, etc.) that have C++ TensorImpl references invisible
+        # to gc.get_objects(). Force-freeing them causes "invalid device
+        # pointer" crashes at exit when C++ destructors try to free
+        # the already-deleted addresses.
+        #
+        # The model graph walker now handles all model memory including
+        # MXFP4 Triton tensors, so force_free is no longer needed for
+        # its original purpose. Remaining blocks are typically <0.2GB
+        # of non-growing C++ overhead.
+        _log_remaining_allocated_blocks()
 
     # Final cleanup pass
     gc.collect()
