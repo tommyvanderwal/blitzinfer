@@ -566,6 +566,15 @@ def clear_cudnn_cublas_workspaces():
     that can accumulate memory across model switches.
     """
     try:
+        # Clear cuBLAS workspaces using internal API
+        # This is essential after force-freeing MXFP4 blocks to prevent
+        # CUBLAS_STATUS_INTERNAL_ERROR on subsequent model loads
+        try:
+            torch._C._cuda_clearCublasWorkspaces()
+            logger.debug("Cleared cuBLAS workspaces via _cuda_clearCublasWorkspaces")
+        except Exception as e:
+            logger.debug(f"_cuda_clearCublasWorkspaces not available: {e}")
+
         # Toggle benchmark to force workspace re-selection
         original_benchmark = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = not original_benchmark
@@ -795,6 +804,58 @@ def force_free_phantom_blocks(min_size_mb: float = 100.0) -> int:
     return freed_count
 
 
+def force_free_all_allocated_blocks() -> tuple[int, float]:
+    """Force-free ALL remaining allocated blocks using caching_allocator_delete.
+
+    This is essential for freeing MXFP4 quantization memory which uses opaque
+    CUDA allocations that can't be freed via normal tensor operations.
+
+    IMPORTANT: Only call this AFTER all Python references to GPU tensors have
+    been deleted and all vLLM/model code has been shut down. Calling this while
+    C++ code still holds references will cause crashes.
+
+    Returns:
+        Tuple of (blocks_deleted, bytes_deleted_gb)
+    """
+    try:
+        snapshot = torch.cuda.memory._snapshot()
+        segments = snapshot.get('segments', [])
+
+        blocks_deleted = 0
+        bytes_deleted = 0
+
+        for seg in segments:
+            blocks = seg.get('blocks', [])
+            for block in blocks:
+                if block.get('state') == 'active_allocated':
+                    # Try both 'addr' and 'address' keys
+                    addr = block.get('addr', block.get('address', 0))
+                    size = block.get('size', 0)
+                    if addr:
+                        try:
+                            torch.cuda.caching_allocator_delete(addr)
+                            blocks_deleted += 1
+                            bytes_deleted += size
+                        except Exception:
+                            # Block may already be freed or invalid
+                            pass
+
+        # Clean up after force deletion
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        bytes_deleted_gb = bytes_deleted / 1024**3
+        if blocks_deleted > 0:
+            logger.info(f"Force-freed {blocks_deleted} blocks ({bytes_deleted_gb:.2f}GB)")
+
+        return blocks_deleted, bytes_deleted_gb
+
+    except Exception as e:
+        logger.debug(f"force_free_all_allocated_blocks error: {e}")
+        return 0, 0.0
+
+
 def nuclear_cleanup(force_free_phantoms: bool = False):
     """Ultimate cleanup - use after full_cleanup() if drift persists.
 
@@ -840,7 +901,7 @@ def nuclear_cleanup(force_free_phantoms: bool = False):
     logger.debug("Nuclear cleanup complete")
 
 
-def full_cleanup(llm, nuclear: bool = True) -> float:
+def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
     """Full cleanup including parallel state destruction.
 
     This is more aggressive than cleanup_vllm_model and should be used
@@ -850,11 +911,17 @@ def full_cleanup(llm, nuclear: bool = True) -> float:
         llm: The vLLM LLM instance to clean up.
         nuclear: If True, run additional cleanup steps to minimize
                  residual memory drift (~0.6GB per switch). Default True.
+        force_free: If True, force-free ALL remaining allocated blocks.
+                    Essential for MXFP4 models which have opaque CUDA allocations.
+                    Default True.
 
     Returns:
         Amount of GPU memory freed in GB.
     """
-    freed = cleanup_vllm_model(llm)
+    free_before, total = torch.cuda.mem_get_info()
+
+    # Standard cleanup
+    cleanup_vllm_model(llm)
 
     # Clear all vLLM caches
     clear_vllm_caches()
@@ -866,10 +933,37 @@ def full_cleanup(llm, nuclear: bool = True) -> float:
     if nuclear:
         nuclear_cleanup()
 
+    # Intermediate cleanup pass
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # Force-free ALL remaining allocated blocks
+    # This is essential for MXFP4 models which have opaque CUDA allocations
+    # that can't be freed via normal tensor operations
+    if force_free:
+        # CRITICAL: Clear cuBLAS workspaces BEFORE force-freeing blocks!
+        # cuBLAS holds internal pointers to workspace memory. If we force-free
+        # those blocks first, then call clearCublasWorkspaces, it crashes with
+        # "invalid device pointer" because cuBLAS tries to access freed memory.
+        try:
+            torch._C._cuda_clearCublasWorkspaces()
+            logger.debug("Cleared cuBLAS workspaces before force-free")
+        except Exception as e:
+            logger.debug(f"_cuda_clearCublasWorkspaces: {e}")
+
+        # Now safe to force-free all remaining blocks
+        force_free_all_allocated_blocks()
+
     # Final cleanup pass
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+
+    free_after, _ = torch.cuda.mem_get_info()
+    freed = (free_after - free_before) / 1024**3
+
+    logger.info(f"GPU cleanup: freed {freed:.1f}GB ({(total-free_before)/1024**3:.1f}GB -> {(total-free_after)/1024**3:.1f}GB used)")
 
     return freed
 
