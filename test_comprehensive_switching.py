@@ -240,6 +240,10 @@ def load_model(model_name: str) -> LLM:
     print(f"Loading: {model_name}")
     print(f"{'='*60}")
 
+    # FLA cache clearing is now handled by cleanup.py's full_cleanup()
+    # It clears FLA caches AFTER unloading any model, which is cleaner
+    # and frees memory sooner than clearing before load.
+
     log_gpu_memory("before load")
     start = time.perf_counter()
 
@@ -485,35 +489,25 @@ def run_model_tests(llm, model_name: str, config: dict) -> dict:
     return {"model": model_name, "tests": tests, "passed": passed, "total": total, "skipped": skipped}
 
 
-# Track if FLA has been used in this session
-# Once FLA is used, force_free becomes unsafe for the rest of the session
-FLA_USED_IN_SESSION = False
-# Track if we're in FLA-inclusive mode (no force_free at all)
+# FLA_MODE is no longer needed - cleanup.py now clears FLA caches after force_free
 FLA_MODE = False
 
 
 def cleanup_model(llm, model_name: str) -> float:
     """Clean up model and return freed memory.
 
-    Uses selective force_free based on mode and model type:
-    - Non-FLA mode: force_free=True for MXFP4 models, False for others
-    - FLA mode: force_free=False always (to avoid corrupting FLA's cached state)
+    Uses force_free=True for MXFP4 models (gpt-oss-120b) to properly release
+    opaque CUDA allocations. FLA models (qwen3-coder-next) are now safe because
+    cleanup.py clears FLA module caches after force_free.
     """
-    global FLA_USED_IN_SESSION
-
     print(f"\nCleaning up {model_name}...")
     log_gpu_memory("before cleanup")
 
     config = MODELS.get(model_name, {})
     is_mxfp4 = config.get("is_mxfp4", False)
 
-    # Determine force_free based on mode and model
-    if FLA_MODE:
-        # In FLA mode, never use force_free to avoid corrupting FLA cache
-        use_force_free = False
-    else:
-        # In non-FLA mode, use force_free for MXFP4 models
-        use_force_free = is_mxfp4
+    # Use force_free for MXFP4 models - FLA cache clearing now handles the conflict
+    use_force_free = is_mxfp4
 
     start = time.perf_counter()
     freed = full_cleanup(llm, nuclear=True, force_free=use_force_free)
@@ -530,25 +524,22 @@ def main():
     print("Comprehensive Model Switching Test")
     print("="*70)
 
-    # Check if we should include FLA models (qwen3-coder-next)
-    # FLA models use Flash Linear Attention which caches tensors internally.
-    # These caches conflict with force_free cleanup, so FLA models should be
-    # tested separately in their own Python process.
-    include_fla = os.environ.get("INCLUDE_FLA_MODELS", "0") == "1"
+    # FLA models (qwen3-coder-next) now work with force_free thanks to
+    # clear_fla_module_caches() in cleanup.py. Can be disabled with env var.
+    include_fla = os.environ.get("EXCLUDE_FLA_MODELS", "0") != "1"
 
     global FLA_MODE
-    FLA_MODE = include_fla
+    FLA_MODE = False  # No longer needed - FLA cache clearing handles it
 
     # Filter models based on FLA inclusion
     test_models = {k: v for k, v in MODELS.items()
                    if include_fla or not v.get("uses_fla", False)}
 
     if include_fla:
-        print("Mode: ALL models (including FLA - force_free disabled)")
-        print("  NOTE: Memory cleanup limited due to FLA state caching")
+        print("Mode: ALL models (FLA cache clearing enabled)")
     else:
-        print("Mode: Non-FLA models only (force_free enabled for MXFP4)")
-        print("  To include FLA models: INCLUDE_FLA_MODELS=1")
+        print("Mode: Non-FLA models only")
+        print("  To include FLA models: unset EXCLUDE_FLA_MODELS")
 
     print(f"Models: {', '.join(test_models.keys())}")
 

@@ -813,17 +813,73 @@ def clear_fla_module_caches():
     it will try to use these invalid cached tensors and crash with
     "invalid device pointer".
 
-    The fix is to delete the FLA modules from sys.modules, forcing Python to
-    reimport them fresh with empty caches on next use.
+    The fix:
+    1. Find all tensor_cache-decorated functions in FLA modules
+    2. Access their closure cells and clear the cache_entries list
+    3. Resize tensor storages to 0 (safely frees CUDA memory)
+    4. Delete modules from sys.modules
+    5. Force multiple GC cycles to collect all generations
 
-    This function should be called AFTER force_free_all_allocated_blocks() and
-    BEFORE loading any model that uses FLA ops.
+    CRITICAL: This function must be called BEFORE force_free_all_allocated_blocks()
+    to ensure FLA tensor destructors can properly free their CUDA memory.
     """
     import sys
+    import types
 
-    fla_modules = [name for name in list(sys.modules.keys())
-                   if 'fla' in name.lower()]
+    # First, try to clear tensor_cache closures directly
+    fla_modules = {name: mod for name, mod in list(sys.modules.items())
+                   if mod is not None and 'fla' in name.lower()}
 
+    tensors_cleared = 0
+
+    for name, mod in fla_modules.items():
+        # Look for functions with tensor_cache closures
+        for attr_name in dir(mod):
+            try:
+                attr = getattr(mod, attr_name, None)
+                if not callable(attr) or not hasattr(attr, '__closure__'):
+                    continue
+
+                closure = attr.__closure__
+                if closure is None:
+                    continue
+
+                # Look for cache_entries (a list) in closure cells
+                for cell in closure:
+                    try:
+                        cell_contents = cell.cell_contents
+                        # cache_entries is a list of (args, kwargs, result) tuples
+                        if isinstance(cell_contents, list):
+                            for entry in cell_contents:
+                                if isinstance(entry, tuple) and len(entry) == 3:
+                                    # entry = (args, kwargs, result)
+                                    args, kwargs, result = entry
+                                    # Clear tensor storages safely
+                                    for item in (args if isinstance(args, tuple) else ()):
+                                        if isinstance(item, torch.Tensor) and item.device.type == 'cuda':
+                                            try:
+                                                item.data.storage().resize_(0)
+                                                tensors_cleared += 1
+                                            except Exception:
+                                                pass
+                                    if isinstance(result, torch.Tensor) and result.device.type == 'cuda':
+                                        try:
+                                            result.data.storage().resize_(0)
+                                            tensors_cleared += 1
+                                        except Exception:
+                                            pass
+                            # Clear the list itself
+                            cell_contents.clear()
+                    except ValueError:
+                        # Empty cell
+                        pass
+            except Exception:
+                pass
+
+    if tensors_cleared > 0:
+        logger.debug(f"Cleared {tensors_cleared} tensors from FLA tensor_cache closures")
+
+    # Now delete modules from sys.modules
     if fla_modules:
         for name in fla_modules:
             try:
@@ -831,7 +887,17 @@ def clear_fla_module_caches():
             except KeyError:
                 pass
 
-        logger.debug(f"Cleared {len(fla_modules)} FLA modules to reset tensor caches")
+        # Force multiple GC cycles to collect ALL generations
+        # Generation 0, 1, 2 may hold different objects
+        for _ in range(5):
+            gc.collect(0)  # Young generation
+            gc.collect(1)  # Middle generation
+            gc.collect(2)  # Old generation
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        logger.debug(f"Cleared {len(fla_modules)} FLA modules and ran GC to free tensor caches")
 
 
 def force_free_all_allocated_blocks() -> tuple[int, float]:
@@ -968,6 +1034,14 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
+    # ALWAYS clear FLA (Flash Linear Attention) module caches BEFORE force_free.
+    # FLA's tensor_cache decorator stores tensor references in closures.
+    # Clearing FLA modules makes these cached tensors orphaned, and GC (called
+    # inside clear_fla_module_caches) destroys them while CUDA memory is still
+    # valid. If we wait until after force_free, the tensor destructors crash
+    # with "invalid device pointer".
+    clear_fla_module_caches()
+
     # Force-free ALL remaining allocated blocks
     # This is essential for MXFP4 models which have opaque CUDA allocations
     # that can't be freed via normal tensor operations
@@ -984,12 +1058,6 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
 
         # Now safe to force-free all remaining blocks
         force_free_all_allocated_blocks()
-
-        # Clear FLA (Flash Linear Attention) module caches
-        # FLA's tensor_cache decorator stores tensor references in closures.
-        # After force_free, these references become invalid. Clearing the modules
-        # forces them to reinitialize with fresh caches on next import.
-        clear_fla_module_caches()
 
     # Final cleanup pass
     gc.collect()
