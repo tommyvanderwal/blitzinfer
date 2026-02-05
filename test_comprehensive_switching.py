@@ -384,57 +384,55 @@ def test_code_model(llm, tests: list) -> list:
 
 
 def test_vision_model(llm, tests: list) -> list:
-    """Test vision model with images.
+    """Test vision model with images using llm.chat() for correct tokenization.
 
-    Note: Vision input format varies by model. Kimi-VL has specific requirements
-    that may differ from the standard vLLM format. If vision tests fail,
-    the general tests will still verify the model is lucid.
+    Uses llm.chat() with OpenAI-format messages so each model's chat template
+    automatically inserts the correct image placeholder tokens (e.g. <|media_pad|>
+    for kimi-vl, <image> for qwen-vl, etc.).
     """
     results = []
     sampling = SamplingParams(max_tokens=100, temperature=0.3)
 
-    # Create test image as PIL Image
+    # Create test image as base64 data URL
     try:
         from PIL import Image
-        # Create a simple 100x100 red square
         img = Image.new('RGB', (100, 100), color='red')
+        buffer = BytesIO()
+        img.save(buffer, format='PNG')
+        img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        img_url = f"data:image/png;base64,{img_b64}"
     except ImportError:
         print("    WARNING: PIL not available, skipping vision-specific tests")
-        img = None
+        img_url = None
 
     for test in tests:
         print(f"\n  Testing: {test['name']}")
         try:
-            if img is None:
-                # Skip vision tests if PIL not available
+            if img_url is None:
                 results.append({"name": test["name"], "passed": False, "error": "PIL not available"})
                 continue
 
-            # vLLM vision input format - use PIL Image directly
-            # Note: Some models like Kimi-VL may require different placeholder format
-            prompt = {
-                "prompt": f"<image>\n{test['prompt']}",
-                "multi_modal_data": {
-                    "image": img
+            # Use llm.chat() with OpenAI-format messages - handles image
+            # placeholder tokens automatically via each model's chat template
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": img_url}},
+                        {"type": "text", "text": test['prompt']},
+                    ],
                 }
-            }
-            outputs = llm.generate([prompt], sampling)
+            ]
+            outputs = llm.chat(messages, sampling)
             text = outputs[0].outputs[0].text.strip()
             print(f"    Output: {text[:100]}...")
             passed = test["validate"](text)
             print(f"    Result: {'PASS' if passed else 'FAIL'}")
             results.append({"name": test["name"], "passed": passed, "output": text[:200]})
         except Exception as e:
-            # Vision format errors are common - don't print full traceback
             error_msg = str(e)
-            if "preprocess" in error_msg or "multi_modal" in error_msg.lower():
-                print(f"    SKIP: Vision format incompatible ({error_msg[:50]}...)")
-                results.append({"name": test["name"], "passed": None, "skipped": True, "error": "Vision format incompatible"})
-            else:
-                print(f"    ERROR: {e}")
-                import traceback
-                traceback.print_exc()
-                results.append({"name": test["name"], "passed": False, "error": str(e)})
+            print(f"    ERROR: {error_msg[:200]}")
+            results.append({"name": test["name"], "passed": False, "error": error_msg[:200]})
 
     return results
 
@@ -496,24 +494,18 @@ FLA_MODE = False
 def cleanup_model(llm, model_name: str) -> float:
     """Clean up model and return freed memory.
 
-    Uses force_free=True for MXFP4 models (gpt-oss-120b) to properly release
-    opaque CUDA allocations. FLA models (qwen3-coder-next) are now safe because
-    cleanup.py clears FLA module caches after force_free.
+    Always uses force_free=True to ensure zero memory drift.
+    FLA models are safe because cleanup.py clears FLA caches first,
+    and detach_all_cuda_tensors() prevents exit crashes.
     """
     print(f"\nCleaning up {model_name}...")
     log_gpu_memory("before cleanup")
 
-    config = MODELS.get(model_name, {})
-    is_mxfp4 = config.get("is_mxfp4", False)
-
-    # Use force_free for MXFP4 models - FLA cache clearing now handles the conflict
-    use_force_free = is_mxfp4
-
     start = time.perf_counter()
-    freed = full_cleanup(llm, nuclear=True, force_free=use_force_free)
+    freed = full_cleanup(llm, nuclear=True, force_free=True)
     cleanup_time = time.perf_counter() - start
 
-    print(f"Cleanup time: {cleanup_time:.1f}s (force_free={use_force_free})")
+    print(f"Cleanup time: {cleanup_time:.1f}s (force_free=True)")
     log_gpu_memory("after cleanup")
 
     return freed
