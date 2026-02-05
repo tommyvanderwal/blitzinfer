@@ -804,6 +804,36 @@ def force_free_phantom_blocks(min_size_mb: float = 100.0) -> int:
     return freed_count
 
 
+def clear_fla_module_caches():
+    """Clear Flash Linear Attention (FLA) module caches.
+
+    FLA ops use a tensor_cache decorator that stores tensor references in closures.
+    After force_free deletes memory blocks, these cached references become invalid
+    ("dangling pointers"). If qwen3-coder-next (or any FLA model) is loaded again,
+    it will try to use these invalid cached tensors and crash with
+    "invalid device pointer".
+
+    The fix is to delete the FLA modules from sys.modules, forcing Python to
+    reimport them fresh with empty caches on next use.
+
+    This function should be called AFTER force_free_all_allocated_blocks() and
+    BEFORE loading any model that uses FLA ops.
+    """
+    import sys
+
+    fla_modules = [name for name in list(sys.modules.keys())
+                   if 'fla' in name.lower()]
+
+    if fla_modules:
+        for name in fla_modules:
+            try:
+                del sys.modules[name]
+            except KeyError:
+                pass
+
+        logger.debug(f"Cleared {len(fla_modules)} FLA modules to reset tensor caches")
+
+
 def force_free_all_allocated_blocks() -> tuple[int, float]:
     """Force-free ALL remaining allocated blocks using caching_allocator_delete.
 
@@ -954,6 +984,12 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
 
         # Now safe to force-free all remaining blocks
         force_free_all_allocated_blocks()
+
+        # Clear FLA (Flash Linear Attention) module caches
+        # FLA's tensor_cache decorator stores tensor references in closures.
+        # After force_free, these references become invalid. Clearing the modules
+        # forces them to reinitialize with fresh caches on next import.
+        clear_fla_module_caches()
 
     # Final cleanup pass
     gc.collect()
