@@ -54,7 +54,6 @@ MODELS = {
         "path": "openai/gpt-oss-120b",
         "dtype": "auto",  # MXFP4 quantized
         "gpu_util": 0.90,
-        "max_model_len": 4096,
         "is_harmony": True,
         "is_vision": False,
         "is_mxfp4": True,  # Needs force_free cleanup for opaque CUDA allocations
@@ -64,8 +63,6 @@ MODELS = {
         "path": "Qwen/Qwen3-Coder-Next-FP8",
         "dtype": "auto",  # FP8 quantized
         "gpu_util": 0.94,
-        "max_model_len": 8192,  # Short context for testing, can go up to 200K
-        "max_num_seqs": 2,  # Required for this large model
         "is_harmony": False,
         "is_vision": False,
         "is_mxfp4": False,
@@ -75,7 +72,6 @@ MODELS = {
         "path": "moonshotai/Kimi-VL-A3B-Instruct",
         "dtype": "bfloat16",
         "gpu_util": 0.90,
-        "max_model_len": 4096,
         "is_harmony": False,
         "is_vision": True,
         "is_mxfp4": False,
@@ -85,7 +81,6 @@ MODELS = {
         "path": "Qwen/Qwen3-32B",
         "dtype": "bfloat16",
         "gpu_util": 0.90,
-        "max_model_len": 4096,
         "is_harmony": False,
         "is_vision": False,
         "is_mxfp4": False,
@@ -247,17 +242,18 @@ def load_model(model_name: str) -> LLM:
     log_gpu_memory("before load")
     start = time.perf_counter()
 
-    # Build kwargs
+    # Build kwargs - only set max_model_len if explicitly configured
     kwargs = {
         "model": config["path"],
         "dtype": config["dtype"],
         "gpu_memory_utilization": config["gpu_util"],
-        "max_model_len": config["max_model_len"],
         "trust_remote_code": True,
         "enforce_eager": True,
     }
 
-    # Add max_num_seqs if specified (for large models like qwen3-coder-next)
+    if "max_model_len" in config:
+        kwargs["max_model_len"] = config["max_model_len"]
+
     if "max_num_seqs" in config:
         kwargs["max_num_seqs"] = config["max_num_seqs"]
 
