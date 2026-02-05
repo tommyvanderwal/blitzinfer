@@ -6,6 +6,7 @@ Tests:
 - Qwen3-Coder-Next-FP8: Code generation
 - Kimi-VL-A3B: Vision with base64 images
 - Qwen3-32B: General reasoning
+- GLM-4.6V-NVFP4: Vision MoE with NVFP4 quantization
 
 All models must switch to/from each other without memory leaks.
 """
@@ -83,6 +84,16 @@ MODELS = {
         "gpu_util": 0.90,
         "is_harmony": False,
         "is_vision": False,
+        "is_mxfp4": False,
+        "uses_fla": False,
+    },
+    "glm-4.6v-nvfp4": {
+        "path": "GadflyII/GLM-4.6V-NVFP4",
+        "dtype": "auto",  # NVFP4 quantized
+        "gpu_util": 0.94,
+        "max_model_len": 100000,  # Native 131K needs 23 GiB KV; 100K fits in available ~21 GiB
+        "is_harmony": False,
+        "is_vision": True,
         "is_mxfp4": False,
         "uses_fla": False,
     },
