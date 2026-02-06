@@ -65,6 +65,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from blitzinfer.api.reasoning import extract_reasoning_content
 from blitzinfer.orchestrator.standby_manager import StandbyManager
 from blitzinfer.engine.cleanup import full_cleanup
+from blitzinfer.memory import set_preloaded_weights
 
 
 # =============================================================================
@@ -387,24 +388,32 @@ class ServerState:
         logger.info(f"Created {len(self.queues)} model queues (max_size={MAX_QUEUE_SIZE})")
 
         # Initialize standby manager
-        logger.info("Creating StandbyManager with 88GB pinned arena (11x8GB chunks)...")
+        # Mixed chunk sizes: 64+16+1 = 81GB (all power-of-2, 0% PyTorch overhead)
+        # Fits qwen3-coder-next (~80.4GB) with margin
+        logger.info("Creating StandbyManager with 81GB pinned arena (64+16+1 GB)...")
         start = time.time()
         self.standby = StandbyManager(
-            arena_size_gb=88.0,
-            chunk_size_gb=8.0,
+            chunk_sizes_gb=[64, 16, 1],
             pin_memory=True,
             lazy_arena=False,
         )
         elapsed = time.time() - start
         logger.info(f"StandbyManager initialized in {elapsed:.1f}s")
 
-        # Load initial model
-        # NOTE: gpt-oss-120b uses MXFP4 which has opaque CUDA allocations that can't
-        # be fully freed. Starting with it means switching TO other models works,
-        # but switching FROM gpt-oss-120b to another model will fail.
+        # Load initial model via pinned arena for O_DIRECT speed (~10 GB/s vs ~3 GB/s buffered)
         initial_model = "gpt-oss-120b"
-        logger.info(f"Loading initial model: {initial_model}")
-        await self._load_engine(initial_model)
+        logger.info(f"Loading initial model: {initial_model} (via pinned arena)")
+        initial_info = AVAILABLE_MODELS.get(initial_model)
+        preloaded_weights = None
+        if self.standby and initial_info:
+            self.standby.start_prefetch(initial_info.hf_path)
+            ready = self.standby.wait_for_load(timeout=120.0)
+            if ready and self.standby.is_ready(initial_info.hf_path):
+                preloaded_weights = self.standby.consume_standby()
+                logger.info(f"Initial model prefetched to arena ({len(preloaded_weights)} tensors)")
+        await self._load_engine(initial_model, preloaded_weights=preloaded_weights)
+        if preloaded_weights is not None and self.standby:
+            self.standby.free_arena()
 
         # Start background queue processor
         self._queue_processor_task = asyncio.create_task(self._queue_processor())
@@ -415,15 +424,22 @@ class ServerState:
         logger.info(f"Available models: {list(AVAILABLE_MODELS.keys())}")
         logger.info("=" * 80)
 
-    async def _load_engine(self, model_id: str):
-        """Create a new vLLM LLM for the given model."""
+    async def _load_engine(self, model_id: str, preloaded_weights: Optional[Dict] = None):
+        """Create a new vLLM LLM for the given model.
+
+        Args:
+            model_id: Model identifier from AVAILABLE_MODELS.
+            preloaded_weights: If provided, use pinned arena loader for fast GPU transfer.
+                Dict of tensor name -> torch.Tensor in pinned CPU memory.
+        """
         model_info = AVAILABLE_MODELS.get(model_id)
         if not model_info:
             raise ValueError(f"Unknown model: {model_id}")
 
         start = time.time()
-        crash_log(f"_load_engine: {model_id}, hf_path={model_info.hf_path}")
-        logger.info(f"Loading vLLM engine for {model_id}...")
+        use_pinned = preloaded_weights is not None
+        crash_log(f"_load_engine: {model_id}, hf_path={model_info.hf_path}, pinned={use_pinned}")
+        logger.info(f"Loading vLLM engine for {model_id} (pinned_arena={use_pinned})...")
 
         # vLLM V1 single-process mode for fast switching
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -451,6 +467,12 @@ class ServerState:
         # Apply extra args
         if model_info.extra_args:
             engine_kwargs.update(model_info.extra_args)
+
+        # Use pinned arena loader for fast GPU transfer if weights are preloaded
+        if use_pinned:
+            set_preloaded_weights(preloaded_weights)
+            engine_kwargs["load_format"] = "pinned_arena"
+            logger.info(f"Using pinned arena loader ({len(preloaded_weights)} tensors)")
 
         crash_log(f"_load_engine: LLM() starting")
 
@@ -519,7 +541,7 @@ class ServerState:
         logger.info(f"Engine shutdown complete, freed ~{freed:.1f}GB GPU")
 
     async def _switch_model(self, target_model: str):
-        """Switch to a different model."""
+        """Switch to a different model, using pinned arena if available."""
         if self.current_model == target_model:
             return
 
@@ -531,25 +553,79 @@ class ServerState:
 
         start = time.time()
 
-        # Wait for standby prefetch if running
-        if self.standby:
-            standby_state = self.standby.get_state()
-            if standby_state.name == "LOADING":
-                logger.info("Waiting for background prefetch...")
-                self.standby.wait_for_load(timeout=120.0)
+        # Try to get preloaded weights from standby manager.
+        # The pinned arena loader delegates to vLLM's model.load_weights(),
+        # so it works for ALL model types (vision, AWQ, MoE, FLA, etc.)
+        preloaded_weights = None
+        model_info = AVAILABLE_MODELS.get(target_model)
 
+        if self.standby and model_info:
+            hf_path = model_info.hf_path
+            standby_state = self.standby.get_state()
+
+            if self.standby.is_ready(hf_path):
+                # Weights already prefetched and ready
+                logger.info(f"Standby READY for {target_model} - using pinned arena")
+                preloaded_weights = self.standby.consume_standby()
+
+            elif standby_state.name == "LOADING":
+                # Prefetch in progress - wait for it
+                logger.info("Prefetch in progress, waiting...")
+                wait_start = time.time()
+                ready = self.standby.wait_for_load(timeout=120.0)
+                wait_time = time.time() - wait_start
+                if ready and self.standby.is_ready(hf_path):
+                    logger.info(f"Prefetch completed in {wait_time:.1f}s - using pinned arena")
+                    preloaded_weights = self.standby.consume_standby()
+                else:
+                    logger.warning(f"Prefetch wait failed after {wait_time:.1f}s, falling back to disk")
+
+            else:
+                # No prefetch running - start one and wait
+                logger.info(f"No prefetch for {target_model}, starting now...")
+                prefetch_start = time.time()
+                self.standby.start_prefetch(hf_path)
+                ready = self.standby.wait_for_load(timeout=120.0)
+                prefetch_time = time.time() - prefetch_start
+                if ready and self.standby.is_ready(hf_path):
+                    logger.info(f"On-demand prefetch completed in {prefetch_time:.1f}s - using pinned arena")
+                    preloaded_weights = self.standby.consume_standby()
+                else:
+                    logger.warning(f"On-demand prefetch failed after {prefetch_time:.1f}s, falling back to disk")
+
+        t_prefetch = time.time() - start
+
+        t_shutdown_start = time.time()
         await self._shutdown_engine()
+        t_shutdown = time.time() - t_shutdown_start
 
         mem_ok, mem_msg = verify_memory_available(min_gpu_free_gb=5.0, min_ram_avail_gb=2.0)
         if not mem_ok:
             raise MemoryError(f"Insufficient memory to load {target_model}: {mem_msg}")
 
-        await self._load_engine(target_model)
+        t_load_start = time.time()
+        await self._load_engine(target_model, preloaded_weights=preloaded_weights)
+        t_load = time.time() - t_load_start
+
+        # Free pinned arena immediately - data is on GPU now, no reason to keep it
+        t_arena_start = time.time()
+        if preloaded_weights is not None and self.standby:
+            self.standby.free_arena()
+        t_arena_free = time.time() - t_arena_start
 
         log_memory_state("AFTER_SWITCH")
         elapsed = time.time() - start
         crash_log(f"=== SWITCH #{self.switch_count} COMPLETE in {elapsed:.1f}s ===")
-        logger.info(f"Switch complete in {elapsed:.1f}s")
+
+        # Detailed timing breakdown
+        logger.info(
+            f"SWITCH TIMING #{self.switch_count} ({self.current_model}): "
+            f"total={elapsed:.2f}s | "
+            f"prefetch_wait={t_prefetch:.2f}s | "
+            f"shutdown={t_shutdown:.2f}s | "
+            f"load_engine={t_load:.2f}s | "
+            f"arena_free={t_arena_free:.3f}s"
+        )
 
     def _find_next_model(self) -> Optional[str]:
         """Find the next model that has queued requests."""
@@ -748,6 +824,11 @@ class ServerState:
         self, request: ChatCompletionRequest, request_id: str
     ) -> Union[ChatCompletionResponse, StreamingResponse]:
         """Generate a response using the vLLM engine."""
+        if self.llm is None:
+            raise RuntimeError(f"Engine not available (model switching in progress)")
+
+        # Capture local reference to prevent race with _shutdown_engine
+        llm = self.llm
         model_id = self.current_model
         model_info = AVAILABLE_MODELS[model_id]
 
@@ -796,7 +877,7 @@ class ServerState:
         if request.stream:
             return self._build_streaming_response(
                 request, request_id, model_id, prompt, prompt_token_ids,
-                sampling_params, use_harmony, has_tools
+                sampling_params, use_harmony, has_tools, llm
             )
 
         # Non-streaming generation - run in thread pool to not block event loop
@@ -807,7 +888,7 @@ class ServerState:
                 outputs = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
-                        lambda: self.llm.generate(
+                        lambda: llm.generate(
                             [{"prompt_token_ids": prompt_token_ids}],
                             sampling_params
                         )
@@ -818,7 +899,7 @@ class ServerState:
                 outputs = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
-                        lambda: self.llm.generate([prompt], sampling_params)
+                        lambda: llm.generate([prompt], sampling_params)
                     ),
                     timeout=GENERATION_TIMEOUT,
                 )
@@ -1071,7 +1152,8 @@ class ServerState:
     def _build_streaming_response(
         self, request: ChatCompletionRequest, request_id: str,
         model_id: str, prompt: Optional[str], prompt_token_ids: Optional[List[int]],
-        sampling_params: SamplingParams, use_harmony: bool, has_tools: bool
+        sampling_params: SamplingParams, use_harmony: bool, has_tools: bool,
+        llm: "LLM" = None,
     ) -> StreamingResponse:
         """Build a streaming SSE response."""
 
@@ -1088,7 +1170,7 @@ class ServerState:
                 if prompt_token_ids is not None:
                     outputs = await loop.run_in_executor(
                         None,
-                        lambda: self.llm.generate(
+                        lambda: llm.generate(
                             [{"prompt_token_ids": prompt_token_ids}],
                             sampling_params
                         )
@@ -1096,7 +1178,7 @@ class ServerState:
                 else:
                     outputs = await loop.run_in_executor(
                         None,
-                        lambda: self.llm.generate([prompt], sampling_params)
+                        lambda: llm.generate([prompt], sampling_params)
                     )
 
                 output = outputs[0]
@@ -1309,7 +1391,9 @@ async def chat_completions(request: ChatCompletionRequest):
 
     try:
         # If this model is already active and queue is empty, fast-path directly
-        if model_id == state.current_model and state.queues[model_id].empty() and state.in_flight == 0:
+        if (model_id == state.current_model and state.llm is not None
+                and state.queues[model_id].empty() and state.in_flight == 0
+                and state.queue_state == QueueState.SERVING):
             request_id = str(uuid.uuid4())[:8]
             state.request_count += 1
             logger.info(f"[{request_id}] Fast-path: model={model_id}")

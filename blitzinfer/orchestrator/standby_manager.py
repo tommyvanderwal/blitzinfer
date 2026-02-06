@@ -71,6 +71,7 @@ class StandbyManager:
         self,
         arena_size_gb: float = 80.0,
         chunk_size_gb: float = 16.0,
+        chunk_sizes_gb: Optional[list] = None,
         pin_memory: bool = True,
         lazy_arena: bool = False,
     ):
@@ -78,21 +79,20 @@ class StandbyManager:
 
         Args:
             arena_size_gb: Size of the memory arena in GB.
-                          Should be large enough for your largest model.
-                          Default 80GB (5x 16GB) fits GPT-OSS-120B (~65GB) with margin.
+                          Ignored if chunk_sizes_gb is provided.
             chunk_size_gb: Size of each arena chunk in GB (default 16GB).
-                          MUST be a power of 2 (1, 2, 4, 8, 16, 32GB) to avoid
-                          PyTorch's power-of-2 rounding overhead.
-                          See: https://github.com/pytorch/pytorch/issues/150517
-                          16GB chunks give 0% overhead and ~44 GB/s transfer.
+                          Ignored if chunk_sizes_gb is provided.
+            chunk_sizes_gb: Explicit list of chunk sizes in GB, e.g. [64, 16, 1].
+                           Each MUST be a power of 2 to avoid PyTorch overhead.
+                           Total arena size = sum of list.
             pin_memory: Whether to use CUDA pinned memory (default True).
-                       Pinned memory achieves ~44 GB/s transfer vs ~4.6 GB/s non-pinned.
             lazy_arena: If False (default), pre-allocate arena at init.
                        If True, allocate on first prefetch (original behavior).
         """
         from ..memory import PinnedMemoryArena
 
-        self._arena_size_gb = arena_size_gb
+        self._chunk_sizes_gb = chunk_sizes_gb
+        self._arena_size_gb = sum(chunk_sizes_gb) if chunk_sizes_gb else arena_size_gb
         self._chunk_size_gb = chunk_size_gb
         self._pin_memory = pin_memory
         self._slot = StandbySlot()
@@ -105,16 +105,20 @@ class StandbyManager:
         if lazy_arena:
             self._arena: Optional['PinnedMemoryArena'] = None
         else:
-            num_chunks = int(arena_size_gb / chunk_size_gb)
+            if chunk_sizes_gb:
+                desc = "+".join(f"{s}GB" for s in chunk_sizes_gb)
+            else:
+                num_chunks = int(arena_size_gb / chunk_size_gb)
+                desc = f"{num_chunks}x{chunk_size_gb}GB"
             mem_type = "pinned" if pin_memory else "regular"
             logger.info(
-                f"Pre-allocating {arena_size_gb}GB {mem_type} arena "
-                f"({num_chunks}x{chunk_size_gb}GB chunks)..."
+                f"Pre-allocating {self._arena_size_gb}GB {mem_type} arena ({desc})..."
             )
             self._arena = PinnedMemoryArena(
-                arena_size_gb,
+                self._arena_size_gb,
                 pin_memory=pin_memory,
-                chunk_size_gb=chunk_size_gb
+                chunk_size_gb=chunk_size_gb,
+                chunk_sizes_gb=chunk_sizes_gb,
             )
             logger.info(f"Arena ready: {self._arena.size_gb:.1f}GB")
 
@@ -220,7 +224,6 @@ class StandbyManager:
             PinnedMemoryArena,
             load_model_to_arena,
             get_model_size,
-            get_premerged_tensors_for_vllm,
         )
 
         print(f"[STANDBY-WORKER] Starting load worker for {model_name}", flush=True)
@@ -247,15 +250,14 @@ class StandbyManager:
 
             # Allocate arena if needed (lazy mode only)
             if self._arena is None:
-                num_chunks = int(self._arena_size_gb / self._chunk_size_gb)
                 mem_type = "pinned" if self._pin_memory else "regular"
-                print(f"[STANDBY-WORKER] Allocating {self._arena_size_gb}GB {mem_type} arena "
-                      f"({num_chunks}x{self._chunk_size_gb}GB chunks)...", flush=True)
+                print(f"[STANDBY-WORKER] Allocating {self._arena_size_gb}GB {mem_type} arena...", flush=True)
                 arena_start = time.perf_counter()
                 self._arena = PinnedMemoryArena(
                     self._arena_size_gb,
                     pin_memory=self._pin_memory,
-                    chunk_size_gb=self._chunk_size_gb
+                    chunk_size_gb=self._chunk_size_gb,
+                    chunk_sizes_gb=self._chunk_sizes_gb,
                 )
                 arena_time = time.perf_counter() - arena_start
                 print(f"[STANDBY-WORKER] Arena allocated in {arena_time:.1f}s", flush=True)
@@ -277,7 +279,7 @@ class StandbyManager:
             # Load into arena with parallel I/O for maximum throughput
             print(f"[STANDBY-WORKER] Loading model to arena...", flush=True)
             load_start = time.perf_counter()
-            load_model_to_arena(str(model_path), self._arena, model_name, parallel_workers=8)
+            load_model_to_arena(str(model_path), self._arena, model_name, parallel_workers=16)
             load_time = time.perf_counter() - load_start
             load_speed = model_gb / load_time if load_time > 0 else 0
             print(f"[STANDBY-WORKER] Loaded {model_name} in {load_time:.1f}s ({load_speed:.1f} GB/s)", flush=True)
@@ -288,14 +290,14 @@ class StandbyManager:
                 self._arena.release(model_name)
                 return
 
-            # Get pinned tensors and premerge for vLLM
+            # Get raw pinned tensors (original safetensor names).
+            # vLLM's model.load_weights() handles all name mapping, quantization,
+            # MoE fusion, etc. - no premerge needed.
             print(f"[STANDBY-WORKER] Getting pinned tensors...", flush=True)
             premerge_start = time.perf_counter()
             pinned_tensors = self._arena.get_all_tensors(model_name)
-            print(f"[STANDBY-WORKER] Got {len(pinned_tensors)} tensors, premerging...", flush=True)
-            premerged = get_premerged_tensors_for_vllm(pinned_tensors)
             premerge_time = time.perf_counter() - premerge_start
-            print(f"[STANDBY-WORKER] Pre-merged {len(premerged)} tensors in {premerge_time:.1f}s", flush=True)
+            print(f"[STANDBY-WORKER] Got {len(pinned_tensors)} raw tensors in {premerge_time:.1f}s", flush=True)
 
             total_time = time.perf_counter() - t0
 
@@ -306,7 +308,7 @@ class StandbyManager:
                     self._arena.release(model_name)
                     return
 
-                self._slot.premerged_tensors = premerged
+                self._slot.premerged_tensors = pinned_tensors
                 self._slot.load_time = total_time
                 self._slot.model_size_gb = model_gb
                 self._slot.state = StandbyState.READY
@@ -382,6 +384,16 @@ class StandbyManager:
             except Exception as e:
                 logger.warning(f"Failed to release arena: {e}")
         self._slot = StandbySlot()
+
+    def free_arena(self):
+        """Free all arena allocations immediately.
+
+        Call this after model loading to GPU completes - the pinned arena
+        data is no longer needed once weights are on GPU.
+        """
+        if self._arena is not None:
+            self._arena.clear()
+            logger.info("Arena freed after model loading")
 
     def evict_standby(self):
         """Evict current standby model (release pinned memory)."""

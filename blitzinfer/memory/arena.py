@@ -62,31 +62,48 @@ class PinnedMemoryArena:
         size_gb: float,
         pin_memory: bool = True,
         chunk_size_gb: float = 16.0,
+        chunk_sizes_gb: Optional[list] = None,
     ):
         """Initialize the arena with a fixed size, allocated in chunks.
 
         Args:
-            size_gb: Total size of the arena in gigabytes.
+            size_gb: Total size of the arena in gigabytes. Ignored if
+                    chunk_sizes_gb is provided (total derived from list).
             pin_memory: Whether to use CUDA pinned memory. Default True.
                        Pinned memory achieves ~44 GB/s transfer speed.
                        Non-pinned achieves ~4.6 GB/s (10x slower).
             chunk_size_gb: Size of each chunk in GB (default 16GB).
                           MUST be a power of 2 (1, 2, 4, 8, 16, 32GB) to avoid
                           PyTorch's power-of-2 rounding overhead.
-                          See: https://github.com/pytorch/pytorch/issues/150517
-                          Non-power-of-2 sizes get rounded up (e.g., 5GB → 8GB = 60% overhead).
-                          16GB chunks give 0% overhead and fast allocation.
+                          Ignored if chunk_sizes_gb is provided.
+            chunk_sizes_gb: Explicit list of chunk sizes in GB, e.g. [64, 16, 1].
+                           Each MUST be a power of 2 to avoid PyTorch overhead.
+                           When provided, size_gb and chunk_size_gb are ignored.
         """
         self._lock = threading.RLock()
         self._pinned = pin_memory
-        self._chunk_size_bytes = int(chunk_size_gb * 1024**3)
-        requested_size = int(size_gb * 1024**3)
+
+        # Build chunk size list
+        if chunk_sizes_gb is not None:
+            chunk_sizes_bytes = [int(s * 1024**3) for s in chunk_sizes_gb]
+            requested_size = sum(chunk_sizes_bytes)
+            size_gb = requested_size / 1024**3
+            desc = "+".join(f"{s}GB" for s in chunk_sizes_gb)
+        else:
+            self._chunk_size_bytes = int(chunk_size_gb * 1024**3)
+            requested_size = int(size_gb * 1024**3)
+            num_chunks = (requested_size + self._chunk_size_bytes - 1) // self._chunk_size_bytes
+            chunk_sizes_bytes = []
+            remaining = requested_size
+            for _ in range(num_chunks):
+                cs = min(self._chunk_size_bytes, remaining)
+                chunk_sizes_bytes.append(cs)
+                remaining -= cs
+            desc = f"{len(chunk_sizes_bytes)}x{chunk_size_gb}GB"
 
         mem_type = "pinned" if pin_memory else "regular"
-        num_chunks = (requested_size + self._chunk_size_bytes - 1) // self._chunk_size_bytes
         logger.info(
-            f"Allocating {size_gb:.1f}GB {mem_type} memory arena "
-            f"({num_chunks} chunks of {chunk_size_gb:.1f}GB)..."
+            f"Allocating {size_gb:.1f}GB {mem_type} memory arena ({desc})..."
         )
         start = time.time()
 
@@ -95,10 +112,7 @@ class PinnedMemoryArena:
         self._chunk_offsets: list = []  # Start offset of each chunk
         total_allocated = 0
 
-        for i in range(num_chunks):
-            remaining = requested_size - total_allocated
-            this_chunk_size = min(self._chunk_size_bytes, remaining)
-
+        for i, this_chunk_size in enumerate(chunk_sizes_bytes):
             try:
                 chunk = torch.empty(
                     this_chunk_size,
@@ -109,7 +123,7 @@ class PinnedMemoryArena:
                 self._chunk_offsets.append(total_allocated)
                 self._chunks.append(chunk)
                 total_allocated += this_chunk_size
-                logger.info(f"  Chunk {i+1}/{num_chunks}: {this_chunk_size / 1024**3:.1f}GB OK")
+                logger.info(f"  Chunk {i+1}/{len(chunk_sizes_bytes)}: {this_chunk_size / 1024**3:.1f}GB OK")
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 if pin_memory and i == 0:
                     # Fall back to non-pinned memory on first failure
@@ -127,7 +141,7 @@ class PinnedMemoryArena:
                     self._pinned = False
                 else:
                     # For subsequent failures, keep what we have
-                    logger.error(f"Failed to allocate chunk {i+1}/{num_chunks}: {e}")
+                    logger.error(f"Failed to allocate chunk {i+1}/{len(chunk_sizes_bytes)}: {e}")
                     logger.error(f"Arena reduced: {total_allocated / 1024**3:.1f}GB of {size_gb:.1f}GB requested")
                     break
 
@@ -218,13 +232,33 @@ class PinnedMemoryArena:
 
             # Check available space
             if self._free_offset + size_bytes > self._size_bytes:
-                # Try to make space by evicting LRU models
-                needed = (self._free_offset + size_bytes) - self._size_bytes
-                freed = self._evict_lru(needed)
-                if freed < needed:
+                # In chunked mode, we can't move data between chunks for compaction.
+                # Instead, evict ALL other models and reset to start of arena.
+                # This works well for the standby pattern (one model at a time).
+                if self._buffer is None and self._chunks:
+                    # Chunked mode: evict everything and start fresh
+                    names_to_evict = list(self._allocations.keys())
+                    for name in names_to_evict:
+                        logger.info(f"Evicting {name} from arena (chunked mode reset)")
+                        self._release_internal(name)
+                    self._free_offset = 0
+                else:
+                    # Single-buffer mode: try selective eviction
+                    needed = (self._free_offset + size_bytes) - self._size_bytes
+                    freed = self._evict_lru(needed)
+                    if freed < needed:
+                        raise MemoryError(
+                            f"Not enough space in arena. Need {size_bytes / 1024**3:.2f}GB, "
+                            f"available {self.available_bytes / 1024**3:.2f}GB"
+                        )
+
+                # Final check after eviction
+                if self._free_offset + size_bytes > self._size_bytes:
                     raise MemoryError(
-                        f"Not enough space in arena. Need {size_bytes / 1024**3:.2f}GB, "
-                        f"available {self.available_bytes / 1024**3:.2f}GB"
+                        f"Not enough space in arena after eviction. "
+                        f"Need {size_bytes / 1024**3:.2f}GB, "
+                        f"free_offset={self._free_offset / 1024**3:.2f}GB, "
+                        f"arena_size={self._size_bytes / 1024**3:.2f}GB"
                     )
 
             # Allocate
@@ -290,10 +324,14 @@ class PinnedMemoryArena:
         return freed
 
     def _compact(self):
-        """Compact the arena by moving all allocations to the start.
+        """Compact the arena after eviction.
 
-        This is a simple compaction strategy that moves all data to remove gaps.
-        For production use, a more sophisticated approach might be needed.
+        In chunked mode (self._buffer is None), we can't move data between
+        chunks easily. Instead, just update _free_offset to after the last
+        allocation. This works because eviction releases models, and the
+        next allocation will overwrite the freed space.
+
+        In single-buffer mode, we physically move data to remove gaps.
         """
         if not self._allocations:
             self._free_offset = 0
@@ -305,6 +343,13 @@ class PinnedMemoryArena:
             key=lambda a: a.start_offset
         )
 
+        if self._buffer is None:
+            # Chunked mode: can't move data, just set free offset after last alloc
+            last_alloc = sorted_allocs[-1]
+            self._free_offset = last_alloc.end_offset
+            return
+
+        # Single-buffer mode: physically compact
         new_offset = 0
         for alloc in sorted_allocs:
             if alloc.start_offset != new_offset:

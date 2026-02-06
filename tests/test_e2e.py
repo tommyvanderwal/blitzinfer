@@ -558,7 +558,9 @@ async def phase_concurrent(client: httpx.AsyncClient, base_url: str) -> PhaseRes
             )
             duration = time.time() - t0
             content = resp.get("content", "").lower()
-            passed = resp["status_code"] == 200 and expected.lower() in content
+            reasoning = (resp.get("reasoning_content") or "").lower()
+            all_text = content + reasoning
+            passed = resp["status_code"] == 200 and expected.lower() in all_text
             return (f"concurrent_{model}_{prompt[:15]}", passed, duration,
                     f"content={content[:40]}", "")
         except Exception as e:

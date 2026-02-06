@@ -26,6 +26,7 @@ import torch
 from vllm import LLM, SamplingParams
 
 from blitzinfer.engine.cleanup import full_cleanup, get_gpu_memory_info, log_gpu_memory
+from blitzinfer.api.reasoning import extract_reasoning_content
 
 # Try to import Harmony utilities
 try:
@@ -54,7 +55,7 @@ MODELS = {
     "gpt-oss-120b": {
         "path": "openai/gpt-oss-120b",
         "dtype": "auto",  # MXFP4 quantized
-        "gpu_util": 0.90,
+        "gpu_util": 0.94,
         "is_harmony": True,
         "is_vision": False,
         "is_mxfp4": True,  # Needs force_free cleanup for opaque CUDA allocations
@@ -68,20 +69,22 @@ MODELS = {
         "is_vision": False,
         "is_mxfp4": False,
         "uses_fla": True,  # Uses FLA ops - caches tensors that conflict with force_free
+        "is_thinking": True,  # Uses <think>...</think> tags
     },
     "kimi-vl": {
         "path": "moonshotai/Kimi-VL-A3B-Instruct",
         "dtype": "bfloat16",
-        "gpu_util": 0.90,
+        "gpu_util": 0.94,
         "is_harmony": False,
         "is_vision": True,
         "is_mxfp4": False,
         "uses_fla": False,
+        "is_thinking": True,  # Uses ◁think▷...◁/think▷ tags
     },
     "qwen3-32b": {
         "path": "Qwen/Qwen3-32B",
         "dtype": "bfloat16",
-        "gpu_util": 0.90,
+        "gpu_util": 0.94,
         "is_harmony": False,
         "is_vision": False,
         "is_mxfp4": False,
@@ -235,6 +238,25 @@ GENERAL_TESTS = [
         "name": "reasoning",
         "prompt": "If all cats are animals, and Fluffy is a cat, is Fluffy an animal? Yes or no.",
         "validate": lambda r: "yes" in r.lower(),
+    },
+]
+
+# Tests for thinking models - verify reasoning extraction works
+THINKING_TESTS = [
+    {
+        "name": "thinking_math",
+        "prompt": "What is 15 * 7? Think step by step then give the answer.",
+        "max_tokens": 500,
+        # Validate: reasoning should contain think steps, content should have answer
+        "validate_content": lambda r: "105" in r,
+        "validate_reasoning": lambda r: r is not None and len(r) > 10,  # Non-trivial reasoning
+    },
+    {
+        "name": "thinking_logic",
+        "prompt": "If it's raining, the ground is wet. The ground is wet. Is it raining? Think carefully.",
+        "max_tokens": 500,
+        "validate_content": lambda r: len(r) > 0,  # Any non-empty content
+        "validate_reasoning": lambda r: r is not None and len(r) > 10,
     },
 ]
 
@@ -465,6 +487,143 @@ def test_general_model(llm, tests: list) -> list:
     return results
 
 
+def test_thinking_model(llm, tests: list) -> list:
+    """Test thinking model: verify reasoning is extracted and content is clean.
+
+    Thinking models wrap reasoning in tags like <think>...</think> or
+    ◁think▷...◁/think▷. This test verifies that:
+    1. Raw output contains think tags
+    2. extract_reasoning_content() correctly splits reasoning from content
+    3. Content does NOT contain think tags
+    """
+    results = []
+
+    for test in tests:
+        print(f"\n  Testing: {test['name']}")
+        try:
+            sampling = SamplingParams(
+                max_tokens=test.get("max_tokens", 500),
+                temperature=0.7,
+            )
+            outputs = llm.generate([test["prompt"]], sampling)
+            raw_text = outputs[0].outputs[0].text
+
+            # Check raw output has think tags
+            has_think_tags = any(
+                start in raw_text
+                for start, _ in [("<think>", "</think>"), ("◁think▷", "◁/think▷")]
+            )
+            print(f"    Raw has think tags: {has_think_tags}")
+            print(f"    Raw output: {raw_text[:150]}...")
+
+            # Apply reasoning extraction
+            reasoning, content = extract_reasoning_content(raw_text)
+
+            # Clean content should NOT have think tags
+            content_clean = True
+            if content:
+                for start, end in [("<think>", "</think>"), ("◁think▷", "◁/think▷")]:
+                    if start in content or end in content:
+                        content_clean = False
+                        break
+
+            # Validate
+            reasoning_ok = test["validate_reasoning"](reasoning)
+            content_ok = test["validate_content"](content or "")
+
+            passed = has_think_tags and content_clean and reasoning_ok and content_ok
+
+            if reasoning:
+                print(f"    Reasoning: {reasoning[:100]}...")
+            print(f"    Content: {(content or '(none)')[:100]}")
+            print(f"    Tags present={has_think_tags}, clean={content_clean}, "
+                  f"reasoning_ok={reasoning_ok}, content_ok={content_ok}")
+            print(f"    Result: {'PASS' if passed else 'FAIL'}")
+
+            results.append({
+                "name": test["name"],
+                "passed": passed,
+                "output": (content or "")[:200],
+                "has_think_tags": has_think_tags,
+                "content_clean": content_clean,
+            })
+        except Exception as e:
+            print(f"    ERROR: {e}")
+            results.append({"name": test["name"], "passed": False, "error": str(e)})
+
+    return results
+
+
+def test_extract_reasoning_unit() -> list:
+    """Unit tests for extract_reasoning_content() - no model needed."""
+    results = []
+
+    test_cases = [
+        {
+            "name": "standard_think_tags",
+            "input": "<think>Let me calculate. 2+2=4</think>The answer is 4.",
+            "expect_reasoning": "Let me calculate. 2+2=4",
+            "expect_content": "The answer is 4.",
+        },
+        {
+            "name": "kimi_unicode_tags",
+            "input": "◁think▷Working through the problem step by step.◁/think▷The result is 42.",
+            "expect_reasoning": "Working through the problem step by step.",
+            "expect_content": "The result is 42.",
+        },
+        {
+            "name": "no_think_tags",
+            "input": "Just a normal response without any thinking.",
+            "expect_reasoning": None,
+            "expect_content": "Just a normal response without any thinking.",
+        },
+        {
+            "name": "unclosed_think_tag",
+            "input": "<think>Started reasoning but got truncated...",
+            "expect_reasoning": "Started reasoning but got truncated...",
+            "expect_content": None,
+        },
+        {
+            "name": "empty_reasoning",
+            "input": "<think></think>Direct answer.",
+            "expect_reasoning": None,  # Empty reasoning becomes None
+            "expect_content": "Direct answer.",
+        },
+        {
+            "name": "multiline_reasoning",
+            "input": "<think>\nStep 1: Consider the problem\nStep 2: Solve it\n</think>\nThe answer is 42.",
+            "expect_reasoning": "Step 1: Consider the problem\nStep 2: Solve it",
+            "expect_content": "The answer is 42.",
+        },
+        {
+            "name": "kimi_unclosed",
+            "input": "◁think▷Thinking about this problem deeply...",
+            "expect_reasoning": "Thinking about this problem deeply...",
+            "expect_content": None,
+        },
+    ]
+
+    print("\n--- Unit tests for extract_reasoning_content ---")
+    for tc in test_cases:
+        reasoning, content = extract_reasoning_content(tc["input"])
+        reasoning_ok = reasoning == tc["expect_reasoning"]
+        content_ok = content == tc["expect_content"]
+        passed = reasoning_ok and content_ok
+
+        print(f"  {tc['name']}: {'PASS' if passed else 'FAIL'}")
+        if not passed:
+            if not reasoning_ok:
+                print(f"    Expected reasoning: {tc['expect_reasoning']!r}")
+                print(f"    Got reasoning:      {reasoning!r}")
+            if not content_ok:
+                print(f"    Expected content: {tc['expect_content']!r}")
+                print(f"    Got content:      {content!r}")
+
+        results.append({"name": f"unit_{tc['name']}", "passed": passed})
+
+    return results
+
+
 def run_model_tests(llm, model_name: str, config: dict) -> dict:
     """Run appropriate tests for a model."""
     print(f"\n--- Running tests for {model_name} ---")
@@ -480,6 +639,11 @@ def run_model_tests(llm, model_name: str, config: dict) -> dict:
         tests.extend(test_general_model(llm, GENERAL_TESTS))
     else:
         tests = test_general_model(llm, GENERAL_TESTS)
+
+    # Add thinking model tests if applicable
+    if config.get("is_thinking", False):
+        print(f"\n  --- Thinking model tests for {model_name} ---")
+        tests.extend(test_thinking_model(llm, THINKING_TESTS))
 
     # Count results, excluding skipped tests
     passed = sum(1 for t in tests if t.get("passed") == True)
@@ -541,6 +705,14 @@ def main():
         print("  To include FLA models: unset EXCLUDE_FLA_MODELS")
 
     print(f"Models: {', '.join(test_models.keys())}")
+
+    # Run unit tests first (no model needed)
+    unit_results = test_extract_reasoning_unit()
+    unit_passed = sum(1 for r in unit_results if r["passed"])
+    unit_total = len(unit_results)
+    print(f"\nUnit tests: {unit_passed}/{unit_total} passed")
+    if unit_passed < unit_total:
+        print("WARNING: Unit test failures - reasoning extraction may not work correctly!")
 
     # Track memory
     initial_mem = get_gpu_memory_info()
@@ -675,11 +847,14 @@ def main():
     tests_ok = total_tests_run == 0 or total_tests_passed >= total_tests_run * 0.8
 
     print(f"\n{'='*70}")
-    if all_loads_success and memory_ok and tests_ok:
+    units_ok = unit_passed == unit_total
+
+    if all_loads_success and memory_ok and tests_ok and units_ok:
         print("OVERALL: PASS")
         print(f"  - All {len(switch_sequence)} model loads successful")
         print(f"  - Memory OK ({final_mem['free_gb']:.1f}GB free, drift {total_drift:+.1f}GB)")
         print(f"  - Tests: {total_tests_passed}/{total_tests_run} passed")
+        print(f"  - Unit tests: {unit_passed}/{unit_total} passed")
         if total_skipped > 0:
             print(f"  - Skipped: {total_skipped} (vision format incompatible)")
     else:
@@ -691,6 +866,8 @@ def main():
             print(f"  - Memory leak ({final_mem['free_gb']:.1f}GB free, need 90+GB)")
         if not tests_ok:
             print(f"  - Too many test failures ({total_tests_passed}/{total_tests_run})")
+        if not units_ok:
+            print(f"  - Unit test failures ({unit_passed}/{unit_total})")
     print("="*70)
 
 
