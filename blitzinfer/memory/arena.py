@@ -107,40 +107,53 @@ class PinnedMemoryArena:
         )
         start = time.time()
 
+        # Ensure CUDA is initialized before allocating pinned memory.
+        # pin_memory=True requires CUDA context; without this, early
+        # allocation (before any model load) fails with CUDA OOM.
+        if pin_memory and torch.cuda.is_available():
+            torch.cuda.init()
+
         # Allocate memory in chunks
         self._chunks: list = []
         self._chunk_offsets: list = []  # Start offset of each chunk
         total_allocated = 0
 
+        use_pin = pin_memory
         for i, this_chunk_size in enumerate(chunk_sizes_bytes):
             try:
                 chunk = torch.empty(
                     this_chunk_size,
                     dtype=torch.uint8,
-                    pin_memory=pin_memory,
+                    pin_memory=use_pin,
                     device='cpu'
                 )
                 self._chunk_offsets.append(total_allocated)
                 self._chunks.append(chunk)
                 total_allocated += this_chunk_size
-                logger.info(f"  Chunk {i+1}/{len(chunk_sizes_bytes)}: {this_chunk_size / 1024**3:.1f}GB OK")
+                pin_label = "pinned" if use_pin else "regular"
+                logger.info(f"  Chunk {i+1}/{len(chunk_sizes_bytes)}: {this_chunk_size / 1024**3:.1f}GB {pin_label} OK")
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                if pin_memory and i == 0:
-                    # Fall back to non-pinned memory on first failure
-                    logger.warning(f"Pinned memory allocation failed at chunk {i+1}: {e}")
-                    logger.warning("Falling back to regular memory")
-                    chunk = torch.empty(
-                        this_chunk_size,
-                        dtype=torch.uint8,
-                        pin_memory=False,
-                        device='cpu'
-                    )
-                    self._chunk_offsets.append(total_allocated)
-                    self._chunks.append(chunk)
-                    total_allocated += this_chunk_size
+                if use_pin:
+                    # Fall back to non-pinned memory
+                    logger.warning(f"Pinned allocation failed at chunk {i+1}: {e}")
+                    logger.warning("Falling back to regular memory for all remaining chunks")
+                    use_pin = False
                     self._pinned = False
+                    try:
+                        chunk = torch.empty(
+                            this_chunk_size,
+                            dtype=torch.uint8,
+                            pin_memory=False,
+                            device='cpu'
+                        )
+                        self._chunk_offsets.append(total_allocated)
+                        self._chunks.append(chunk)
+                        total_allocated += this_chunk_size
+                        logger.info(f"  Chunk {i+1}/{len(chunk_sizes_bytes)}: {this_chunk_size / 1024**3:.1f}GB regular OK")
+                    except Exception as e2:
+                        logger.error(f"Failed to allocate chunk {i+1} even as regular: {e2}")
+                        break
                 else:
-                    # For subsequent failures, keep what we have
                     logger.error(f"Failed to allocate chunk {i+1}/{len(chunk_sizes_bytes)}: {e}")
                     logger.error(f"Arena reduced: {total_allocated / 1024**3:.1f}GB of {size_gb:.1f}GB requested")
                     break

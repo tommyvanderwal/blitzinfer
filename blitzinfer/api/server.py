@@ -377,6 +377,12 @@ class ServerState:
         self._failed_models: Dict[str, float] = {}  # model_id -> failure timestamp
         self._failed_model_cooldown = 120.0  # seconds before retrying failed model
 
+        # First-request timing: tracks when a model becomes ready and whether
+        # the first request after a switch has been served yet
+        self._first_request_pending: bool = True   # True until first request completes
+        self._model_ready_time: float = 0.0        # When _load_engine() completed
+        self._switch_start_time: float = 0.0       # When _switch_model() started
+
     async def initialize(self):
         logger.info("=" * 80)
         logger.info("BLITZINFER SERVER INITIALIZING (vLLM + Queues)")
@@ -494,6 +500,8 @@ class ServerState:
         crash_log(f"_load_engine: LLM() done")
 
         self.current_model = model_id
+        self._model_ready_time = time.time()
+        self._first_request_pending = True
 
         elapsed = time.time() - start
         crash_log(f"_load_engine: {model_id} loaded in {elapsed:.1f}s")
@@ -552,6 +560,7 @@ class ServerState:
         logger.info("=" * 60)
 
         start = time.time()
+        self._switch_start_time = start
 
         # Try to get preloaded weights from standby manager.
         # The pinned arena loader delegates to vLLM's model.load_weights(),
@@ -833,9 +842,12 @@ class ServerState:
         model_info = AVAILABLE_MODELS[model_id]
 
         self.request_count += 1
+        is_first = self._first_request_pending
+        t_request_start = time.time()
 
         logger.info(f"[{request_id}] Generating: model={model_id}, "
-                    f"msgs={len(request.messages)}, max_tokens={request.max_tokens}")
+                    f"msgs={len(request.messages)}, max_tokens={request.max_tokens}"
+                    f"{' [FIRST REQUEST]' if is_first else ''}")
 
         use_harmony = HAS_HARMONY and model_id == "gpt-oss-120b"
         has_tools = request.tools and len(request.tools) > 0
@@ -872,7 +884,8 @@ class ServerState:
         )
 
         # Generate
-        start = time.time()
+        t_prompt_built = time.time()
+        prompt_build_time = t_prompt_built - t_request_start
 
         if request.stream:
             return self._build_streaming_response(
@@ -882,6 +895,7 @@ class ServerState:
 
         # Non-streaming generation - run in thread pool to not block event loop
         loop = asyncio.get_event_loop()
+        t_gen_start = time.time()
 
         try:
             if prompt_token_ids is not None:
@@ -907,8 +921,9 @@ class ServerState:
             logger.error(f"[{request_id}] Generation timed out after {GENERATION_TIMEOUT}s")
             raise RuntimeError(f"Generation timed out after {GENERATION_TIMEOUT}s")
 
+        t_gen_end = time.time()
         output = outputs[0]
-        elapsed = time.time() - start
+        gen_time = t_gen_end - t_gen_start
 
         generated_text = output.outputs[0].text
         output_token_ids = output.outputs[0].token_ids
@@ -917,9 +932,36 @@ class ServerState:
         total_tokens = prompt_tokens + completion_tokens
         self.total_tokens += total_tokens
 
-        tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+        elapsed = t_gen_end - t_request_start
+        tokens_per_sec = completion_tokens / gen_time if gen_time > 0 else 0
         logger.info(f"[{request_id}] Generated {completion_tokens} tokens "
-                    f"in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+                    f"in {gen_time:.2f}s ({tokens_per_sec:.1f} tok/s)")
+
+        # Detailed timing for first request after model load/switch
+        if is_first:
+            self._first_request_pending = False
+            time_since_ready = t_request_start - self._model_ready_time
+            time_since_switch = t_request_start - self._switch_start_time if self._switch_start_time > 0 else 0
+            # Estimate TTFT: prompt processing is roughly (gen_time - completion_tokens/tok_rate)
+            # but vLLM batches, so gen_time includes both prefill + decode
+            # A rough estimate: if decode is at tok/s rate, prefill is the remainder
+            decode_time_est = completion_tokens / tokens_per_sec if tokens_per_sec > 0 else gen_time
+            prefill_time_est = gen_time - decode_time_est
+            ttft_est = prompt_build_time + max(prefill_time_est, 0)
+            logger.info(
+                f"[{request_id}] FIRST REQUEST TIMING ({model_id}):\n"
+                f"  prompt_build={prompt_build_time:.3f}s | "
+                f"llm.generate={gen_time:.2f}s | "
+                f"total={elapsed:.2f}s\n"
+                f"  prompt_tokens={prompt_tokens} | "
+                f"completion_tokens={completion_tokens} | "
+                f"tok/s={tokens_per_sec:.1f}\n"
+                f"  time_since_model_ready={time_since_ready:.2f}s | "
+                f"time_since_switch_start={time_since_switch:.2f}s\n"
+                f"  est_prefill={prefill_time_est:.3f}s | "
+                f"est_decode={decode_time_est:.2f}s | "
+                f"est_ttft={ttft_est:.3f}s"
+            )
 
         # Get finish reason
         finish_reason = output.outputs[0].finish_reason or "stop"
