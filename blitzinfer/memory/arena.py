@@ -340,6 +340,41 @@ class PinnedMemoryArena:
                 return i, offset - chunk_start
         raise IndexError(f"Offset {offset} is beyond arena size {self._size_bytes}")
 
+    def get_buffer_ptr(self, offset: int, size: int) -> list:
+        """Get raw buffer pointer(s) for a region of the arena.
+
+        Thread-safe: callers write to non-overlapping regions so no lock needed.
+
+        Args:
+            offset: Start byte offset in the arena.
+            size: Number of bytes needed.
+
+        Returns:
+            List of (ptr, available_bytes) tuples. Usually one entry unless
+            the region spans a chunk boundary. ptr is a ctypes-compatible
+            integer address.
+        """
+        if not self._is_chunked:
+            ptr = self._base_ptr + offset
+            return [(ptr, min(size, self._size_bytes - offset))]
+
+        # Chunked mode: may span multiple chunks
+        segments = []
+        remaining = size
+        current_offset = offset
+
+        while remaining > 0:
+            chunk_idx, chunk_offset = self._get_chunk_for_offset(current_offset)
+            chunk = self._chunks[chunk_idx]
+            available = len(chunk) - chunk_offset
+            seg_size = min(remaining, available)
+            ptr = chunk.data_ptr() + chunk_offset
+            segments.append((ptr, seg_size))
+            remaining -= seg_size
+            current_offset += seg_size
+
+        return segments
+
     def read_file_into(self, file_path: str, offset: int) -> int:
         """Read a file directly into the arena at the specified offset.
 
