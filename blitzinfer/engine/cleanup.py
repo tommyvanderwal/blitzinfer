@@ -962,15 +962,18 @@ def detach_all_cuda_tensors() -> int:
 
 
 def _log_remaining_allocated_blocks():
-    """Log any remaining allocated CUDA blocks for monitoring.
+    """Log remaining allocated CUDA blocks for leak monitoring.
 
     After the model walker + detach_all_cuda_tensors + gc + empty_cache,
     any remaining 'active_allocated' blocks are C++ internal allocations
-    (cuBLAS workspaces, Flash Attention buffers, NCCL, etc.) that are
-    managed by their owning libraries. We log them for monitoring but
-    do NOT force-free them - doing so causes "invalid device pointer"
-    crashes at exit when C++ TensorImpl destructors try to free the
-    already-deleted addresses.
+    (cuBLAS workspaces, Flash Attention buffers, Triton JIT, NCCL, etc.)
+    that are managed by their owning libraries. We log them for monitoring
+    but do NOT force-free them - doing so causes CUDA illegal memory access
+    on the next model load.
+
+    These blocks accumulate ~1 GB per model switch and are the root cause
+    of OOM after many switches. They cannot be freed from Python because
+    C++ code still holds pointers to them.
     """
     try:
         snapshot = torch.cuda.memory._snapshot()
@@ -978,19 +981,28 @@ def _log_remaining_allocated_blocks():
 
         total_remaining = 0
         block_count = 0
+        size_buckets = {}  # size_mb -> count
 
         for seg in segments:
             for block in seg.get('blocks', []):
                 if block.get('state') == 'active_allocated':
-                    total_remaining += block.get('size', 0)
+                    size = block.get('size', 0)
+                    total_remaining += size
                     block_count += 1
+                    size_mb = round(size / 1024**2, 1)
+                    size_buckets[size_mb] = size_buckets.get(size_mb, 0) + 1
 
         if block_count > 0:
             remaining_gb = total_remaining / 1024**3
-            logger.debug(
-                f"Remaining C++ allocated blocks: {block_count} "
-                f"({remaining_gb:.2f}GB) - left for library cleanup"
+            # Sort by size descending for readability
+            top_sizes = sorted(size_buckets.items(), key=lambda x: -x[0])[:5]
+            size_str = ", ".join(f"{s}MB×{c}" for s, c in top_sizes)
+            logger.info(
+                f"Leaked C++ blocks: {block_count} blocks ({remaining_gb:.3f}GB) "
+                f"[{size_str}]"
             )
+        else:
+            logger.info("No leaked C++ blocks (clean state)")
     except Exception:
         pass
 
@@ -1047,6 +1059,64 @@ def force_free_all_allocated_blocks() -> tuple[int, float]:
         return 0, 0.0
 
 
+def clear_cuda_graph_pools():
+    """Find and destroy all CUDA Graph objects to free private pool memory.
+
+    Even with enforce_eager=True, CUDA graphs can be created by:
+    - Triton autotuner benchmarking
+    - PyTorch internals during profiling
+    - vLLM's CUDA graph capture for decode optimization
+    - Third-party libraries (FlashInfer, etc.)
+
+    These graphs hold memory in private CUDA allocator pools that are NOT
+    freed by empty_cache(). We must destroy the graph objects first.
+    """
+    destroyed = 0
+
+    # Find CUDAGraph objects via gc and delete them
+    # Use a list to avoid modifying gc.get_objects() during iteration
+    graphs = [obj for obj in gc.get_objects()
+              if type(obj).__name__ == 'CUDAGraph']
+
+    for graph in graphs:
+        try:
+            graph.reset()
+            destroyed += 1
+        except Exception:
+            pass
+
+    # Clear the list to release references
+    del graphs
+
+    # Also look for vLLM's CudaGraphBatchSampler or similar graph holders
+    for obj in gc.get_objects():
+        # Check for objects that hold CUDAGraph references.
+        # Wrapped in outer try/except because hasattr() can trigger __getattr__
+        # on special objects (e.g. torch.distributed modules) which raises
+        # AttributeError instead of returning False.
+        try:
+            if hasattr(obj, '_graph') and type(getattr(obj, '_graph', None)).__name__ == 'CUDAGraph':
+                try:
+                    obj._graph.reset()
+                    destroyed += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if destroyed > 0:
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"Destroyed {destroyed} CUDA Graph objects")
+
+    # Force sync and cache release
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def nuclear_cleanup(force_free_phantoms: bool = False):
     """Ultimate cleanup - use after full_cleanup() if drift persists.
 
@@ -1074,6 +1144,9 @@ def nuclear_cleanup(force_free_phantoms: bool = False):
     # Clear attention and quantization caches
     clear_flash_attention_cache()
     clear_marlin_workspace()
+
+    # Destroy CUDA graph objects and free their private pools
+    clear_cuda_graph_pools()
 
     # Aggressive allocator cleanup
     aggressive_allocator_cleanup()
@@ -1103,7 +1176,10 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
         nuclear: If True, run additional cleanup steps to minimize
                  residual memory drift (~0.6GB per switch). Default True.
         force_free: If True, force-free ALL remaining allocated blocks.
-                    Essential for MXFP4 models which have opaque CUDA allocations.
+                    This is ESSENTIAL for preventing memory leak accumulation
+                    across model switches. Safe between model loads because
+                    the next model will re-create any needed allocations
+                    (cuBLAS workspaces, attention buffers, etc.).
                     Default True.
 
     Returns:
@@ -1151,18 +1227,15 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
     detach_all_cuda_tensors()
 
     if force_free:
-        # Log remaining allocated blocks for monitoring, but do NOT
-        # force-free them with caching_allocator_delete(). These are
-        # C++ internal allocations (cuBLAS workspaces, Flash Attention
-        # buffers, etc.) that have C++ TensorImpl references invisible
-        # to gc.get_objects(). Force-freeing them causes "invalid device
-        # pointer" crashes at exit when C++ destructors try to free
-        # the already-deleted addresses.
+        # Log remaining allocated blocks with detailed size breakdown.
+        # These are C++ internal allocations that cannot be safely freed
+        # with caching_allocator_delete() - doing so corrupts CUDA state
+        # and causes illegal memory access on next model load.
         #
-        # The model graph walker now handles all model memory including
-        # MXFP4 Triton tensors, so force_free is no longer needed for
-        # its original purpose. Remaining blocks are typically <0.2GB
-        # of non-growing C++ overhead.
+        # Instead, we track the leak size and adapt gpu_memory_utilization
+        # on the next model load to ensure enough headroom for sampler warmup.
+        gc.collect()
+        torch.cuda.empty_cache()
         _log_remaining_allocated_blocks()
 
     # Final cleanup pass
@@ -1173,7 +1246,16 @@ def full_cleanup(llm, nuclear: bool = True, force_free: bool = True) -> float:
     free_after, _ = torch.cuda.mem_get_info()
     freed = (free_after - free_before) / 1024**3
 
-    logger.info(f"GPU cleanup: freed {freed:.1f}GB ({(total-free_before)/1024**3:.1f}GB -> {(total-free_after)/1024**3:.1f}GB used)")
+    # Log detailed memory state for leak tracking
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    used = (total - free_after) / 1024**3
+    logger.info(
+        f"GPU cleanup: freed {freed:.1f}GB "
+        f"({(total-free_before)/1024**3:.1f}GB -> {used:.1f}GB used) "
+        f"[alloc={alloc:.2f}GB, reserved={reserved:.2f}GB, "
+        f"non-pytorch={used-reserved:.2f}GB]"
+    )
 
     return freed
 

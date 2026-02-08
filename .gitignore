@@ -62,3 +62,14 @@ vllm/
 # Temporary files
 /tmp/
 *.tmp
+
+# Local caches (model weights, compiled kernels)
+.cache/
+
+# Vendored source trees (large)
+rocm-triton/
+sglang/
+amd_smi/
+amd_smi_build/
+vllm_source/
+venv_vllm/
