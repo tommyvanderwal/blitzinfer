@@ -17,6 +17,7 @@ import gc
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -85,6 +86,7 @@ class FlushingStreamHandler(logging.StreamHandler):
         self.flush()
 
 CRASH_LOG_FILE = os.path.expanduser('~/blitzinfer_crash.log')
+SESSION_LOG_FILE = os.path.expanduser('~/blitzinfer_sessions.log')
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -96,6 +98,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('blitzinfer.api')
+
+# Dedicated session logger for full request/response debugging
+session_logger = logging.getLogger('blitzinfer.sessions')
+session_logger.setLevel(logging.DEBUG)
+session_logger.propagate = False  # Don't spam main log
+_session_handler = FlushingFileHandler(SESSION_LOG_FILE, mode='a')
+_session_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+session_logger.addHandler(_session_handler)
 
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -141,6 +151,13 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
         # No context_length - use model's native 128K
         gpu_memory_utilization=GPU_MEM_FRAC,
         dtype="bfloat16",  # Required for MXFP4 MoE kernels
+        # max_num_seqs=256: gpt-oss-120b has 200K vocab. Default 1024 seqs causes
+        # sampler warmup to allocate 1024*200K*4B=2.3 GiB of temporary memory.
+        # After model switches, C++ internal allocations (Triton JIT, NCCL, etc.)
+        # accumulate ~1 GB/switch in PyTorch's allocator, reducing headroom.
+        # With max_num_seqs=256, warmup only needs ~0.6 GiB (fits even after 20+ switches).
+        # KV cache is unaffected - max concurrency is ~3x at 131K context anyway.
+        extra_args={"max_num_seqs": 256},
     ),
     "qwen3-32b": ModelInfo(
         name="qwen3-32b",
@@ -170,8 +187,15 @@ AVAILABLE_MODELS: Dict[str, ModelInfo] = {
     "qwen3-coder-next": ModelInfo(
         name="qwen3-coder-next",
         hf_path="Qwen/Qwen3-Coder-Next-FP8",
-        gpu_memory_utilization=GPU_MEM_FRAC,
+        # Weights: 74.89 GiB. CUDA graphs enabled for ~2-3x decode speedup.
+        # max_num_batched_tokens=2048: reduces peak activation memory during
+        # chunked prefill and CUDA graph capture (default 16384 uses too much).
+        # max_num_seqs=32: reduces sampler warmup memory (default 256 OOMs after
+        # many switches when residual non-pytorch memory eats into margin).
+        gpu_memory_utilization=0.90,
+        context_length=110000,
         is_thinking_model=True,  # Uses <think>...</think> tags
+        extra_args={"max_num_seqs": 32, "max_num_batched_tokens": 2048},
     ),
     # GLM-4.6V-NVFP4 disabled: hangs during model construction after switch
     # (0% CPU, stuck at "slow image processor" message). Works on cold start only.
@@ -372,6 +396,7 @@ class ServerState:
         self.queue_state: QueueState = QueueState.SERVING
         self.in_flight: int = 0
         self._switch_lock = asyncio.Lock()
+        self._generate_lock = asyncio.Lock()  # Serialize llm.generate() calls
         self._switch_event = asyncio.Event()
         self._queue_processor_task: Optional[asyncio.Task] = None
         self._failed_models: Dict[str, float] = {}  # model_id -> failure timestamp
@@ -450,14 +475,40 @@ class ServerState:
         # vLLM V1 single-process mode for fast switching
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
-        # Use Triton MXFP4 backend for SM120 (patched)
-        os.environ["VLLM_MXFP4_USE_MARLIN"] = "0"
+        # Use Marlin MXFP4 backend on SM120 (RTX PRO 6000 Blackwell)
+        # Marlin + CUDA graphs = ~200 tok/s (vs Triton StridedLayout = ~31 tok/s)
+        os.environ["VLLM_MXFP4_USE_MARLIN"] = "1"
+
+        # Ensure nvcc is available for FlashInfer JIT compilation
+        cuda_bin = "/usr/local/cuda-13.1/bin"
+        if cuda_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = cuda_bin + ":" + os.environ.get("PATH", "")
+
+        # Dynamic gpu_memory_utilization: adapt to actual free memory.
+        # C++ internal allocations (Triton JIT, NCCL, CUDA driver) accumulate
+        # ~0.5-1 GB per model switch and cannot be freed from Python.
+        # Without adaptation, the sampler warmup + CUDA graph capture OOMs
+        # after ~6 switches. We ensure at least HEADROOM_GB remains free
+        # after KV cache allocation for CUDA graphs, warmup, and overhead.
+        HEADROOM_GB = 3.0  # For CUDA graphs (~0.8GB) + warmup + activations
+        free_gb, total_gb = [x / 1024**3 for x in torch.cuda.mem_get_info()]
+        max_safe_util = (free_gb - HEADROOM_GB) / total_gb
+        configured_util = model_info.gpu_memory_utilization
+        actual_util = min(configured_util, max(0.5, max_safe_util))
+
+        if actual_util < configured_util:
+            lost_kv_gb = (configured_util - actual_util) * total_gb
+            logger.warning(
+                f"Reducing gpu_memory_utilization: {configured_util:.2f} -> {actual_util:.2f} "
+                f"(leaked {total_gb - free_gb:.1f}GB residual, {lost_kv_gb:.1f}GB less KV cache)"
+            )
 
         engine_kwargs = {
             "model": model_info.hf_path,
-            "gpu_memory_utilization": model_info.gpu_memory_utilization,
+            "gpu_memory_utilization": actual_util,
             "trust_remote_code": True,
-            "enforce_eager": True,  # Disable CUDA graphs for faster startup
+            # CUDA graphs provide ~3x decode speedup (62→200 tok/s for gpt-oss-120b)
+            # Trade-off: ~15s extra for graph capture on first load
         }
 
         # Only set max_model_len if explicitly configured
@@ -491,11 +542,41 @@ class ServerState:
             )
         except asyncio.TimeoutError:
             crash_log(f"_load_engine: TIMEOUT loading {model_id} after {MODEL_LOAD_TIMEOUT}s")
+            await self._cleanup_failed_load()
             raise RuntimeError(f"Model {model_id} load timed out after {MODEL_LOAD_TIMEOUT}s")
         except Exception as e:
-            crash_log(f"_load_engine: FAILED loading {model_id}: {e}")
-            logger.error(f"Failed to load model {model_id}: {e}")
-            raise
+            err_str = str(e)
+            # Retry with reduced max_model_len if KV cache is marginally too small.
+            # After many switches, non-pytorch memory drift can reduce available KV
+            # cache by a fraction of a GiB, causing the model's native context to
+            # just barely not fit.
+            m = re.search(r"estimated maximum model length is (\d+)", err_str)
+            if m and "max_model_len" not in engine_kwargs:
+                reduced_len = int(m.group(1))
+                logger.warning(
+                    f"KV cache marginal for {model_id}, retrying with "
+                    f"max_model_len={reduced_len} (was native)"
+                )
+                crash_log(f"_load_engine: KV margin retry max_model_len={reduced_len}")
+                await self._cleanup_failed_load()
+                engine_kwargs["max_model_len"] = reduced_len
+                if use_pinned:
+                    set_preloaded_weights(preloaded_weights)
+                try:
+                    self.llm = await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: LLM(**engine_kwargs)),
+                        timeout=MODEL_LOAD_TIMEOUT,
+                    )
+                except Exception as e2:
+                    crash_log(f"_load_engine: FAILED retry {model_id}: {e2}")
+                    logger.error(f"Failed to load model {model_id} (retry): {e2}")
+                    await self._cleanup_failed_load()
+                    raise
+            else:
+                crash_log(f"_load_engine: FAILED loading {model_id}: {e}")
+                logger.error(f"Failed to load model {model_id}: {e}")
+                await self._cleanup_failed_load()
+                raise
 
         crash_log(f"_load_engine: LLM() done")
 
@@ -506,6 +587,142 @@ class ServerState:
         elapsed = time.time() - start
         crash_log(f"_load_engine: {model_id} loaded in {elapsed:.1f}s")
         logger.info(f"Engine {model_id} loaded in {elapsed:.1f}s")
+
+    async def _cleanup_failed_load(self):
+        """Clean up GPU memory after a failed model load (OOM, timeout, etc.).
+
+        When LLM() constructor fails mid-construction (e.g. OOM during CUDA graph
+        capture), model weights + KV cache (80+ GB) remain allocated on GPU.
+
+        CRITICAL: The partially-constructed LLM has NO llm_engine attribute set
+        (the exception propagates before the assignment in LLM.__init__), so
+        cleanup_vllm_model() can't navigate its internals. The model weights
+        live inside EngineCore → ModelRunner objects that are separate in gc.
+
+        Strategy (layered):
+        1. Find orphaned LLM instances and try cleanup_vllm_model()
+        2. Find ModelRunner objects directly via gc and walk their model graphs
+        3. Run detach_all_cuda_tensors() as safety net for any remaining tensors
+        4. Destroy CUDA graphs (releases references to captured tensors)
+        5. Final gc + empty_cache
+        """
+        crash_log("_cleanup_failed_load: cleaning up after failed model load")
+        logger.warning("Cleaning up GPU memory after failed model load...")
+
+        mem_before = log_memory_state("BEFORE_FAILED_LOAD_CLEANUP")
+
+        try:
+            from blitzinfer.engine.cleanup import (
+                _walk_and_free_cuda_tensors,
+                cleanup_vllm_model,
+                detach_all_cuda_tensors,
+                clear_cuda_graph_pools,
+                destroy_parallel_state,
+                clear_vllm_caches,
+            )
+
+            # Run gc to ensure the failed constructor's frame is cleaned up
+            gc.collect()
+            gc.collect()
+
+            # Strategy 1: Find orphaned LLM instances (works when llm_engine is set)
+            orphaned_count = 0
+            for obj in gc.get_objects():
+                if type(obj).__name__ == 'LLM' and obj is not self.llm:
+                    has_engine = hasattr(obj, 'llm_engine') and obj.llm_engine is not None
+                    logger.info(f"Found orphaned LLM (has_engine={has_engine}), running cleanup_vllm_model...")
+                    try:
+                        cleanup_vllm_model(obj)
+                        orphaned_count += 1
+                    except Exception as e:
+                        logger.warning(f"Orphaned LLM cleanup error: {e}")
+
+            alloc_after_llm = torch.cuda.memory_allocated() / 1024**3
+            logger.info(f"After LLM cleanup ({orphaned_count} LLMs): alloc={alloc_after_llm:.1f}GB")
+
+            # Strategy 2: Find ModelRunner objects directly via gc.
+            # When LLM() fails mid-construction, llm_engine is never set, so
+            # cleanup_vllm_model can't navigate to the model. But ModelRunner
+            # objects exist separately in gc with .model and .kv_caches attributes.
+            runners_cleaned = 0
+            tensors_freed = 0
+            for obj in gc.get_objects():
+                try:
+                    typename = type(obj).__name__
+                    # GPUModelRunner (V1) or ModelRunner (V0) - both have .model and .kv_caches
+                    if 'ModelRunner' in typename:
+                        model = getattr(obj, 'model', None)
+                        if model is not None and isinstance(model, torch.nn.Module):
+                            # Clear static_forward_context first (same as cleanup_vllm_model)
+                            for module in model.modules():
+                                vc = getattr(module, 'vllm_config', None)
+                                if vc is not None:
+                                    cc = getattr(vc, 'compilation_config', None)
+                                    if cc is not None:
+                                        sfc = getattr(cc, 'static_forward_context', None)
+                                        if sfc is not None and isinstance(sfc, dict) and len(sfc) > 0:
+                                            sfc.clear()
+                                            break
+
+                            n = _walk_and_free_cuda_tensors(model)
+                            tensors_freed += n
+                            obj.model = None
+                            logger.info(f"ModelRunner walker freed {n} CUDA tensors")
+
+                        # Free KV caches
+                        kv_caches = getattr(obj, 'kv_caches', None)
+                        if kv_caches:
+                            for kv in kv_caches:
+                                if isinstance(kv, torch.Tensor) and kv.device.type == 'cuda':
+                                    try:
+                                        kv.storage().resize_(0)
+                                        tensors_freed += 1
+                                    except Exception:
+                                        pass
+                            kv_caches.clear()
+
+                        runners_cleaned += 1
+                except Exception:
+                    pass
+
+            if runners_cleaned > 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+                alloc_after_runners = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"After ModelRunner cleanup ({runners_cleaned} runners, {tensors_freed} tensors): alloc={alloc_after_runners:.1f}GB")
+
+            # Strategy 3: Detach ALL remaining CUDA tensors via gc scan
+            detach_all_cuda_tensors()
+
+            # Clear CUDA graphs (releases references to captured tensors)
+            clear_cuda_graph_pools()
+
+            # Clear vLLM caches and parallel state
+            clear_vllm_caches()
+            destroy_parallel_state()
+
+            # Clear cuBLAS workspaces
+            try:
+                torch._C._cuda_clearCublasWorkspaces()
+            except Exception:
+                pass
+
+            # Multi-round GC: destroying CUDA graphs and vLLM caches may have
+            # released the last references to tensor storages. GC + empty_cache
+            # converts those to free memory.
+            for _ in range(3):
+                gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        except Exception as e:
+            logger.warning(f"Failed load cleanup error: {e}")
+            traceback.print_exc()
+
+        mem_after = log_memory_state("AFTER_FAILED_LOAD_CLEANUP")
+        freed = mem_before['gpu_used_gb'] - mem_after['gpu_used_gb']
+        crash_log(f"_cleanup_failed_load: freed ~{freed:.1f}GB GPU")
+        logger.info(f"Failed load cleanup freed ~{freed:.1f}GB GPU")
 
     async def _shutdown_engine(self):
         """Shutdown current vLLM LLM and release GPU memory."""
@@ -606,6 +823,9 @@ class ServerState:
 
         t_shutdown_start = time.time()
         await self._shutdown_engine()
+        # Clear current model tracking AFTER shutdown - if new model fails to load,
+        # this ensures recovery logic triggers (checks self.current_model is None)
+        self.current_model = None
         t_shutdown = time.time() - t_shutdown_start
 
         mem_ok, mem_msg = verify_memory_available(min_gpu_free_gb=5.0, min_ram_avail_gb=2.0)
@@ -711,10 +931,12 @@ class ServerState:
         except asyncio.TimeoutError:
             return
 
-        # Process the request
+        # Process the request (serialize with _generate_lock to prevent
+        # concurrent llm.generate() from fast-path requests)
         self.in_flight += 1
         try:
-            result = await self._generate_response(queued.request, queued.request_id)
+            async with self._generate_lock:
+                result = await self._generate_response(queued.request, queued.request_id)
             if not queued.future.done():
                 queued.future.set_result(result)
         except Exception as e:
@@ -849,6 +1071,19 @@ class ServerState:
                     f"msgs={len(request.messages)}, max_tokens={request.max_tokens}"
                     f"{' [FIRST REQUEST]' if is_first else ''}")
 
+        # Session logging: full request details
+        session_logger.info(f"=== REQUEST {request_id} model={model_id} ===")
+        session_logger.info(f"Messages ({len(request.messages)}):")
+        for i, msg in enumerate(request.messages):
+            session_logger.info(f"  [{i}] role={msg.role} content={str(msg.content)[:500]}")
+            if msg.tool_calls:
+                session_logger.info(f"      tool_calls={msg.tool_calls}")
+            if msg.tool_call_id:
+                session_logger.info(f"      tool_call_id={msg.tool_call_id}")
+        if request.tools:
+            session_logger.info(f"Tools: {json.dumps([t.model_dump() for t in request.tools], indent=2)[:1000]}")
+        session_logger.info(f"Params: max_tokens={request.max_tokens} temp={request.temperature} stream={request.stream}")
+
         use_harmony = HAS_HARMONY and model_id == "gpt-oss-120b"
         has_tools = request.tools and len(request.tools) > 0
 
@@ -863,7 +1098,7 @@ class ServerState:
             )
         if prompt_token_ids is None:
             prompt, image_data = self._build_chat_prompt(
-                request, request_id, model_info
+                request, request_id, model_info, has_tools=has_tools
             )
 
         # Build sampling params
@@ -882,6 +1117,12 @@ class ServerState:
             stop=stop,
             stop_token_ids=stop_token_ids,
         )
+
+        # Session logging: prompt
+        if prompt is not None:
+            session_logger.info(f"[{request_id}] PROMPT ({len(prompt)} chars):\n{prompt[:2000]}")
+        elif prompt_token_ids is not None:
+            session_logger.info(f"[{request_id}] PROMPT_TOKEN_IDS ({len(prompt_token_ids)} tokens)")
 
         # Generate
         t_prompt_built = time.time()
@@ -975,6 +1216,13 @@ class ServerState:
             if tool_calls_list:
                 finish_reason = "tool_calls"
 
+        # Parse tool calls from non-Harmony models (e.g. Qwen3 XML format)
+        if not use_harmony and has_tools and "<tool_call>" in generated_text:
+            tool_calls_list, remaining_text = self._parse_tool_calls(generated_text, request_id)
+            if tool_calls_list:
+                generated_text = remaining_text
+                finish_reason = "tool_calls"
+
         # Extract reasoning content from thinking models (Kimi-VL, Qwen3, etc.)
         reasoning_content = None
         if not use_harmony and model_info.is_thinking_model and generated_text:
@@ -984,6 +1232,14 @@ class ServerState:
             elif reasoning_content is not None:
                 # Model was truncated mid-reasoning, no final content
                 generated_text = ""
+
+        # Session logging: raw output + parsed result
+        session_logger.info(f"[{request_id}] RAW OUTPUT ({len(output.outputs[0].text)} chars):\n{output.outputs[0].text[:3000]}")
+        session_logger.info(
+            f"[{request_id}] PARSED: content={generated_text[:500] if generated_text else None} "
+            f"reasoning={reasoning_content[:200] if reasoning_content else None} "
+            f"tool_calls={tool_calls_list}"
+        )
 
         # Log response
         if generated_text:
@@ -1061,7 +1317,8 @@ class ServerState:
             return None
 
     def _build_chat_prompt(
-        self, request: ChatCompletionRequest, request_id: str, model_info: ModelInfo
+        self, request: ChatCompletionRequest, request_id: str, model_info: ModelInfo,
+        has_tools: bool = False
     ) -> Tuple[str, Optional[Any]]:
         """Build a text prompt using the model's chat template."""
         image_data = None
@@ -1087,13 +1344,41 @@ class ServerState:
                 d["content"] = "\n".join(text_parts) if text_parts else ""
             else:
                 d["content"] = str(msg.content) if msg.content else ""
+
+            # Preserve tool_calls for assistant messages
+            if msg.tool_calls:
+                d["tool_calls"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": (
+                                json.loads(tc.function.arguments)
+                                if isinstance(tc.function.arguments, str)
+                                else tc.function.arguments
+                            ),
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+
+            # Preserve tool_call_id for tool result messages
+            if msg.tool_call_id:
+                d["tool_call_id"] = msg.tool_call_id
+
             messages_dicts.append(d)
 
         # Use vLLM's tokenizer to apply the chat template
         try:
             tokenizer = self.llm.get_tokenizer()
+            template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if has_tools and request.tools:
+                template_kwargs["tools"] = [t.model_dump() for t in request.tools]
             prompt = tokenizer.apply_chat_template(
-                messages_dicts, tokenize=False, add_generation_prompt=True
+                messages_dicts, **template_kwargs
             )
         except Exception as e:
             logger.warning(f"[{request_id}] Chat template failed: {e}, using fallback")
@@ -1188,6 +1473,61 @@ class ServerState:
         return final_text, tool_calls_list
 
     # -------------------------------------------------------------------------
+    # Non-Harmony tool call parsing (Qwen3 XML format)
+    # -------------------------------------------------------------------------
+
+    def _parse_tool_calls(
+        self, text: str, request_id: str
+    ) -> Tuple[List[ToolCall], str]:
+        """Parse tool calls from Qwen3-style XML output.
+
+        Format:
+            <tool_call>
+            <function=function_name>
+            <parameter=param_name>value</parameter>
+            </function>
+            </tool_call>
+
+        Returns (tool_calls_list, remaining_text_before_tool_calls).
+        """
+        tool_calls_list = []
+
+        # Split text at first <tool_call> to get content before tool calls
+        first_tc = text.find("<tool_call>")
+        remaining_text = text[:first_tc].strip() if first_tc >= 0 else text
+
+        # Find all <tool_call>...</tool_call> blocks
+        tc_pattern = re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL)
+        for match in tc_pattern.finditer(text):
+            block = match.group(1)
+
+            # Extract function name
+            func_match = re.search(r'<function=(\S+?)>', block)
+            if not func_match:
+                logger.warning(f"[{request_id}] Tool call block missing function name: {block[:100]}")
+                continue
+            func_name = func_match.group(1)
+
+            # Extract parameters
+            params = {}
+            param_pattern = re.compile(r'<parameter=(\S+?)>(.*?)</parameter>', re.DOTALL)
+            for pm in param_pattern.finditer(block):
+                params[pm.group(1)] = pm.group(2).strip()
+
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            tool_calls_list.append(ToolCall(
+                id=call_id,
+                type="function",
+                function=FunctionCall(
+                    name=func_name,
+                    arguments=json.dumps(params),
+                ),
+            ))
+            logger.info(f"[{request_id}] Parsed tool call: {func_name}({json.dumps(params)[:200]})")
+
+        return tool_calls_list, remaining_text
+
+    # -------------------------------------------------------------------------
     # Streaming
     # -------------------------------------------------------------------------
 
@@ -1272,14 +1612,30 @@ class ServerState:
                         }
                         yield f"data: {json.dumps(data)}\n\n"
                 else:
-                    # Non-Harmony: extract reasoning from thinking models
+                    # Non-Harmony: parse tool calls, then extract reasoning
                     model_info = AVAILABLE_MODELS[model_id]
+
+                    # Parse tool calls from XML format (Qwen3, etc.)
+                    tool_calls = []
+                    if has_tools and "<tool_call>" in generated_text:
+                        tool_calls, generated_text = self._parse_tool_calls(generated_text, request_id)
+                        if tool_calls:
+                            finish_reason = "tool_calls"
+
                     reasoning_content = None
                     content = generated_text
                     if model_info.is_thinking_model and generated_text:
                         reasoning_content, content = extract_reasoning_content(generated_text)
                         if content is None and reasoning_content is not None:
                             content = ""  # Truncated mid-reasoning
+
+                    # Session logging
+                    session_logger.info(f"[{request_id}] STREAM RAW ({len(output.outputs[0].text)} chars):\n{output.outputs[0].text[:3000]}")
+                    session_logger.info(
+                        f"[{request_id}] STREAM PARSED: content={content[:500] if content else None} "
+                        f"reasoning={reasoning_content[:200] if reasoning_content else None} "
+                        f"tool_calls={tool_calls}"
+                    )
 
                     # Emit reasoning_content chunk if present
                     if reasoning_content:
@@ -1296,8 +1652,33 @@ class ServerState:
                         }
                         yield f"data: {json.dumps(data)}\n\n"
 
-                    # Emit content chunk
-                    if content:
+                    # Emit tool calls as chunks
+                    if tool_calls:
+                        for i, tc in enumerate(tool_calls):
+                            tc_data = {
+                                "id": f"chatcmpl-{request_id}",
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [{
+                                            "index": i,
+                                            "id": tc.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tc.function.name,
+                                                "arguments": tc.function.arguments,
+                                            },
+                                        }],
+                                    },
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(tc_data)}\n\n"
+                    elif content:
+                        # Emit content chunk (only if no tool calls)
                         data = {
                             "id": f"chatcmpl-{request_id}",
                             "object": "chat.completion.chunk",
@@ -1432,14 +1813,24 @@ async def chat_completions(request: ChatCompletionRequest):
         logger.debug(f"MSG[{i}] {msg.role}: {preview}")
 
     try:
-        # If this model is already active and queue is empty, fast-path directly
+        # If this model is already active and queue is empty, fast-path directly.
+        # Use _generate_lock to prevent concurrent llm.generate() calls
+        # (vLLM's LLM class is not thread-safe for concurrent generate calls).
         if (model_id == state.current_model and state.llm is not None
                 and state.queues[model_id].empty() and state.in_flight == 0
                 and state.queue_state == QueueState.SERVING):
-            request_id = str(uuid.uuid4())[:8]
-            state.request_count += 1
-            logger.info(f"[{request_id}] Fast-path: model={model_id}")
-            return await state._generate_response(request, request_id)
+            async with state._generate_lock:
+                # Re-check conditions after acquiring lock (another request may have started)
+                if (model_id == state.current_model and state.llm is not None
+                        and state.queue_state == QueueState.SERVING):
+                    request_id = str(uuid.uuid4())[:8]
+                    state.request_count += 1
+                    state.in_flight += 1
+                    try:
+                        logger.info(f"[{request_id}] Fast-path: model={model_id}")
+                        return await state._generate_response(request, request_id)
+                    finally:
+                        state.in_flight -= 1
 
         # Otherwise, enqueue and wait
         future, request_id = await state.enqueue_request(request, model_id)
