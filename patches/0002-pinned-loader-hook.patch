@@ -1,0 +1,30 @@
+Subject: [PATCH] BlitzInfer: route safetensors weights iterator through shared pool
+
+Replace vLLM's `multi_thread_safetensors_weights_iterator` with the
+BlitzInfer version (blitzinfer/loader/pinned_loader.py). When the env
+vars BLITZ_SHARED_POOL + BLITZ_SHARDS_LAYOUT are set (the gateway sets
+them per swap), the iterator reads weight tensors as views into the
+parent's 80 GB hugetlbfs pool instead of `f.readinto`-ing safetensors
+files from disk. Subprocess does cudaHostRegister on the same shared
+file in its own CUDA context, then copies pool → GPU at PCIe wire
+speed (~44-48 GB/s on PCIe 5.0).
+
+If neither env var is set, the iterator falls back to the private-pool
+path and behaves like vLLM's stock loader (so this is also a no-op
+when running plain `vllm serve` outside the gateway).
+
+Targets vLLM 0.20.1.
+
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -34,6 +34,11 @@
+     safetensors_weights_iterator,
+ )
+
++# === BlitzInfer pinned-staged loader override ===
++from blitzinfer.loader.pinned_loader import (
++    multi_thread_safetensors_weights_iterator,  # noqa: F401, F811
++)
++
+ from vllm.tracing import instrument
+ from vllm.transformers_utils.repo_utils import list_filtered_repo_files

@@ -1,0 +1,26 @@
+# BlitzInfer runtime dependencies for the Phase H/I gateway.
+# Tested on Python 3.13.12 with NVIDIA RTX PRO 6000 (Blackwell, SM120),
+# CUDA toolkit 13.1+, driver 595.58.03, kernel 6.17 with `hugepagesz=1G
+# hugepages=80` on the kernel cmdline.
+
+# vLLM 0.20.1 has native SM120 support (NVFP4 MoE CUTLASS, tuned fused_moe).
+# Pin exactly — minor versions can shift cache_key_factors and force a full
+# torch.compile rebuild for every model.
+vllm==0.20.1
+
+# torch 2.11 is the version vLLM 0.20.1 was built against on cu130. Newer
+# patch versions usually work; major bumps tend to break vLLM's compile
+# cache.
+torch==2.11.0
+torchvision
+
+# vLLM and the gateway both rely on these directly.
+flashinfer-python>=0.6.8,<0.7
+transformers>=5.8,<6
+fastapi>=0.115
+uvicorn[standard]>=0.32
+Pillow>=10
+huggingface-hub>=0.26
+
+# OpenAI types are used by the chat-completion request/response models.
+openai>=1.0

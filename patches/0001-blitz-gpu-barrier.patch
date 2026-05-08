@@ -1,0 +1,36 @@
+Subject: [PATCH] BlitzInfer: GPU barrier in worker init_device
+
+Wait for the parent gateway to touch ${BLITZ_GPU_GO_FILE} before the
+worker makes its first CUDA call. Used by the pipelined swap so the
+new EngineCore subprocess can start importing vLLM and parsing config
+while the previous engine is still serving on the GPU — the new worker
+parks on this barrier until the parent confirms (via nvidia-smi
+polling in _wait_for_gpu_baseline) that VRAM has been released.
+
+If BLITZ_GPU_GO_FILE is unset (no gateway, plain `vllm serve` use),
+this is a no-op and worker init proceeds normally.
+
+Targets vLLM 0.20.1; should apply with light fuzz to nearby patch
+versions. The hunk is in WorkerBase.init_device just before the
+torch.accelerator.set_device_index call.
+
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -253,6 +253,17 @@
+                 )
+
+             self.device = torch.device(f"cuda:{self.local_rank}")
++            # === BlitzInfer: wait for parent go-ahead before first CUDA call ===
++            _blitz_go = os.environ.get('BLITZ_GPU_GO_FILE')
++            if _blitz_go:
++                import time as _t, logging as _l
++                _waiting_logged = False
++                while not os.path.exists(_blitz_go):
++                    if not _waiting_logged:
++                        _l.getLogger(__name__).info('BLITZ: waiting for GPU go-ahead at %s', _blitz_go)
++                        _waiting_logged = True
++                    _t.sleep(0.05)
++            # === end BlitzInfer ===
+             torch.accelerator.set_device_index(self.device)
+
+             current_platform.check_if_supports_dtype(self.model_config.dtype)

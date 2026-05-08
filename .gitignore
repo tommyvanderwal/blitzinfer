@@ -73,3 +73,6 @@ amd_smi/
 amd_smi_build/
 vllm_source/
 venv_vllm/
+
+# Claude Code per-project state
+.claude/

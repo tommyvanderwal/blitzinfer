@@ -201,7 +201,7 @@ release() → in_flight--              dispatch above
 ## Target Hardware
 
 ### PRIMARY: RTX PRO 6000 System (REMOTE)
-**SSH**: `ssh tommy@192.168.2.90`
+**SSH**: `ssh ${BLITZINFER_HOST}` (set `BLITZINFER_HOST` to your gateway box's hostname or IP)
 **Path**: `~/pythonprojects/blitzinfer/`
 
 - **GPU**: NVIDIA RTX PRO 6000 (95GB VRAM)
