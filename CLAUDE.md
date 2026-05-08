@@ -4,33 +4,116 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**BlitzInfer** is a high-performance LLM serving orchestrator optimized for fast model switching with intelligent queue management and tiered memory caching.
+**BlitzInfer** is a multi-model LLM serving gateway on top of vLLM 0.20.1, optimized for fast model switching with smart per-model queueing, pipelined loading, and a cross-process shared hugetlbfs pool.
 
-**Current Status**: Phase 2-3 - Fast model switching achieved. Queue-driven prefetch working with ~5-10s warm switches.
+**Current Status (May 2026)**: Phase H/I — production gateway. 9 models in rotation, drain-then-switch queue, pipelined acquire (load-while-serving), per-swap subprocess teardown for 0 MiB drift. End-to-end multimodal (image + video) verified.
 
-## Latest Test Results (Jan 2026)
+## Phase H/I Gateway (May 8, 2026)
 
-**Queue-Driven Test (`test_queue_simple.py`):**
+### What's running
 
-| Metric | Result | Target | Status |
-|--------|--------|--------|--------|
-| Preload time (max) | 8.41s | < 10s | **PASS** |
-| Memory drift | 0.48GB | < 2GB | **PASS** |
-| Weight injection | 39.3 GB/s | - | Excellent |
-| GPT-OSS switch (warm) | 5.36s | < 10s | **PASS** |
-| Qwen VL switch | 16.60s | < 10s | FAIL (vision overhead) |
-| GPT-OSS tool calls | ✓ | - | **PASS** |
-| Qwen VL vision | ✓ | - | **PASS** |
+Single FastAPI process on `:8000`. `ModelManager` (`blitzinfer/api/server.py`) owns one `AsyncLLM` at a time. The EngineCore subprocess is killed and respawned on every model swap — OS reclaims VRAM, drift across swaps is ~0 MiB.
 
-**Key findings:**
-- Weight injection is fast (39.3 GB/s) - bottleneck is vLLM model init
-- Vision models have inherent encoder setup overhead (~6s extra)
-- Warm switches achieve <10s target for text models
-- Memory cleanup is stable (0.48GB drift over 3 switches)
+Registry has 9 models, all OpenAI-compatible:
 
-**Known issues:**
-- Tool calls from OpenCode (Claude Code) don't work with the API server
-- Harmony tool call parsing may need adjustment for external clients
+| Served name | Repo | Quant / size | Notes |
+|---|---|---|---|
+| qwen3.5-122b-a10b | RedHatAI/Qwen3.5-122B-A10B-NVFP4 | NVFP4 / 75 GB | MoE 10B-active, image+**video** |
+| qwen3.6-35b-a3b | Qwen/Qwen3.6-35B-A3B-FP8 | FP8 / 35 GB | MoE, image |
+| qwen3.6-27b | Qwen/Qwen3.6-27B-FP8 | FP8 / 29 GB | dense, image |
+| gemma-4-31b | google/gemma-4-31b-it | BF16 / 59 GB | image |
+| gpt-oss-120b | openai/gpt-oss-120b | MXFP4 MoE / 64 GB | Harmony tool-calls; needs `VLLM_MXFP4_USE_MARLIN=1` |
+| qwen3-coder-next | Qwen/Qwen3-Coder-Next-FP8 | FP8 MoE / 75 GB | qwen3_coder tool parser |
+| qwen3-32b | Qwen/Qwen3-32B-FP8 | FP8 / 32 GB | yarn rope-scaling for 128K |
+| qwen2.5-7b | Qwen/Qwen2.5-7B-Instruct | BF16 / 14 GB | yarn rope-scaling for 128K |
+| kimi-vl | moonshotai/Kimi-VL-A3B-Instruct | BF16 / 6 GB | MLA, image |
+
+### Smart queueing (drain-then-switch)
+
+Per-model FIFO queues at the gateway level. **All requests go through the queue — there is no fast path.** A single dispatcher coroutine owns queue → engine handoff:
+
+1. Drain `queues[active_name]` onto the live engine (in_flight++; vLLM batches internally up to `max_num_seqs=32`).
+2. When the active queue is empty, pick **next model = oldest queued request across all other queues**.
+3. Kick off a *pipelined* swap to that model. Dispatcher keeps draining new arrivals on the active queue while the swap is preparing in the background.
+
+Concrete proof from `/tmp/queue_stress.py`:
+```
+A1 (story on A)   fired @  0.0s  done @ 20.0s
+B1 (short on B)   fired @  0.5s  done @ 43.9s   ← B1 triggered swap-decision
+A2 (short on A)   fired @  1.0s  done @  2.2s   ← arrived AFTER B1, served on A!
+B2 (short on B)   fired @  1.5s  done @ 43.9s
+PASS: all model-A requests finished BEFORE first model-B response
+```
+
+A2 arrived 0.5 s after B1 had already triggered the swap-decision — and was still served on model A, before model A was unloaded. No thrashing.
+
+### Pipelined load (load while serving)
+
+When the dispatcher commits to a next model, `_do_pipelined_swap` immediately starts:
+
+* `pool_task` — parent reads the next model's safetensors shards into the 80 GB shared hugetlbfs file (`/mnt/hugetlbfs/blitz_pool`) at ~10 GB/s (4 shards × 16 chunks parallel preadv).
+* `spawn_task` — new EngineCore subprocess spawns, imports vLLM, parses config, opens tokenizer, hits a custom barrier patched into `vllm/v1/worker/gpu_worker.py` and **waits**.
+
+The dispatcher keeps draining `queues[active_name]` during this prep. Only when the active queue is empty AND `in_flight == 0` does the swap proceed:
+
+1. `_unload()` — `engine.shutdown()` then poll `nvidia-smi --query-gpu=memory.used` until ≤ 2 GiB (proves driver actually reclaimed VRAM, no fixed sleep).
+2. Touch `BLITZ_GPU_GO_FILE` — barrier in subprocess passes, `set_device_index` runs.
+3. Subprocess re-mmaps the same hugetlbfs file in its own CUDA context (`cudaHostRegister` ~1.4 s for 64 GB), copies pool→GPU at PCIe 5 wire speed, builds KV cache, captures CUDA graphs.
+4. `init_app_state` installs `openai_serving_chat` for the new model. Dispatcher wakes, drains `queues[new_name]`.
+
+**Two invariants** (verified in code review with the user):
+* The 80 GB pool is **never used twice**. `SharedPool.load_shards` overwrites in place; once a subprocess has copied weights pool→GPU it never reads pool again.
+* **Never two subprocess loads in parallel.** Dispatcher's `if swap_task is None` gate ensures a second swap can't begin until the current `swap_task` is `.done()`. Pipelining overlaps loading with *serving*, not with another loading.
+
+### Reference benchmark (warm caches, May 8 2026)
+
+9 models, 3 tests each (T1 short, T2 1000-word story, T3 50K-token needle-in-haystack). Pipelined acquire + MM-warmup-skip vs spawn-baseline:
+
+| Model | T1 baseline | T1 new | Δ |
+|---|---|---|---|
+| qwen2.5-7b | 18.5 s | 17.7 s | -4 % |
+| qwen3-32b | 30.4 s | 28.7 s | -6 % |
+| qwen3-coder-next | 39.1 s | 37.6 s | -4 % |
+| **qwen3.6-35b-a3b** | 50.0 s | **36.5 s** | **-27 %** |
+| **qwen3.6-27b** | 58.9 s | **46.3 s** | **-21 %** |
+| qwen3.5-122b-a10b | — | 184 s (cold) → ~75 s warm | new |
+| **gemma-4-31b** | 96.1 s | **55.0 s** | **-43 %** |
+| gpt-oss-120b | 31.8 s | 30.8 s | -3 % |
+| **kimi-vl** | 63.1 s | **29.8 s** | **-53 %** |
+
+8-model wall-clock: **869 s baseline → 814 s = -6.3 %**, plus huge wins on multimodal models (kimi-vl, gemma-4-31b, qwen3.6 family) from the MM-warmup patch (see below).
+
+Pipelining proof (T3 50K on model N runs concurrently with T1 short on model N+1):
+* `qwen3-coder-next || qwen3.6-35b-a3b`: T3 done @ 46.0 s, T1 done @ 73.1 s → **only 27.1 s of swap visible after T3 finished** (vs ~45 s sequential).
+* `gpt-oss-120b || qwen3.5-122b-a10b`: T3 done @ 45.7 s, T1 done @ 86.4 s → **40.8 s post-T3 swap** for a 75 GB NVFP4 MoE (vs ~75 s sequential cold-from-warm).
+
+### Multimodal verification (image + video)
+
+`/tmp/mm_test.py` — image input via OpenAI `image_url` data-URI, video via `video_url`:
+
+| Model | red square | blue square | 2 images | OCR ("HELLO 42") | video r→b | Score |
+|---|---|---|---|---|---|---|
+| kimi-vl | ✓ | ✓ | ✓ | ✓ | n/a | 4/4 |
+| gemma-4-31b | ✓ | ✓ | ✓ | ✓ | n/a | 4/4 |
+| qwen3.6-35b-a3b | ✓ | ✓ | ✓ | ✗ (hallucinated) | n/a | 3/4 |
+| qwen3.6-27b | ✓ | ✓ | ✓ | ✗ (partial chars) | n/a | 3/4 |
+| **qwen3.5-122b-a10b** | ✓ | ✓ | ✓ | ✓ | ✓ "from red to blue" | **5/5** |
+
+The 2 OCR misses are per-model VQA quality limits, not gateway bugs — same image bytes go to all 5 models, 3 read the text correctly. Image input (single + multi) and video input (qwen3.5-122b only) are wired correctly through the gateway.
+
+### Key vLLM patches
+
+* **`vllm/v1/worker/gpu_worker.py`** — barrier wait: subprocess polls for `BLITZ_GPU_GO_FILE` to exist before its first CUDA call (`set_device_index`). Parent only touches the file after the previous engine has fully released VRAM.
+* **`vllm/model_executor/model_loader/default_loader.py`** — imports `multi_thread_safetensors_weights_iterator` from `blitzinfer.loader.pinned_loader`, which reads from the shared hugetlbfs pool instead of `f.readinto`-ing safetensors files directly.
+* **`vllm/renderers/base.py:_warmup_mm_processor`** — monkey-patched to no-op at module import (saves 5–12 s on every multimodal cold load; see `_warmup_mm_processor` below).
+
+### MM warmup is purely first-request-latency
+
+Read of `vllm/renderers/base.py`: `_warmup_mm_processor` runs `processor.apply(dummy_inputs)` then **explicitly clears the cache** (`clear_mm_cache` / `_clear_processor_cache`). The only retained state is Python module-level lazy imports (PIL, torchvision, encoder-kernel JIT) — which would be triggered by the first real MM request anyway. Skipping it saves 5–12 s per multimodal cold load; first MM request pays ~1–2 s for the lazy imports, but only once per subprocess. Patch is a one-liner in `server.py` (`BaseRenderer._warmup_mm_processor = lambda ...: None`).
+
+### Known issue: torch.compile cache pollution from leaky env vars
+
+vLLM 0.20.1 bakes the full `os.environ` into `cache_key_factors.json`. Per-model env (e.g. `VLLM_MXFP4_USE_MARLIN=1` for gpt-oss-120b) set in `_spawn_engine` stays in the parent and silently invalidates the compile cache for every subsequent model whose load order changes — causing a 25–30 s recompile. Documented in memory; fix is to scope per-model env to subprocess only (`subprocess.Popen(env=…)`) instead of mutating the parent.
 
 ## Completed
 
@@ -80,27 +163,40 @@ llm = LLM(
 
 **Bug Report**: `tests/AWQ_MARLIN_CRASH_BUG_REPORT.md`
 
-## Architecture
+## Architecture (May 2026)
 
 ```
-REQUEST GATEWAY (OpenAI API - planned)
+HTTP /v1/chat/completions
     ↓
-PER-MODEL REQUEST QUEUES (implemented)
-    ↓
-MODEL ORCHESTRATOR (BlitzInferOrchestrator)
-    - State machine: COLD → HOT → SERVING
-    - Model registry with queue tracking
-    ↓
-vLLM ENGINE ADAPTER (VLLMEngine)
-    - Model loading/unloading
-    - Proper multiprocess cleanup
+ModelManager.acquire(model)              ← all requests queue here
+    ↓ (per-model deque)
+single dispatcher coroutine
+    ↓                            ↘
+drain queues[active] (FIFO)        if active queue empty + other queue non-empty:
+    ↓                                _do_pipelined_swap(next_model)
+new request future ── set_result(handler)    (oldest queued wins)
+    ↓                                ↓
+chat_completion runs concurrently   spawn EngineCore subprocess +
+on the live engine                  parent loads next weights into 80 GB
+    ↓                                hugetlbfs pool, IN PARALLEL with
+release() → in_flight--              dispatch above
+                                    ↓
+                                    drain wait → unload → wait nvidia-smi
+                                    ≤ 2 GiB → touch BLITZ_GPU_GO_FILE →
+                                    subprocess crosses barrier in
+                                    gpu_worker.py → loads weights from pool
+                                    → init_app_state installs handler →
+                                    notify_all → dispatcher serves new queue
 ```
 
 ### Key Design Principles
 
-- **One model active at a time** - maximizes KV cache utilization
-- **Proper cleanup on switch** - wait for child processes, clear GPU memory
-- **Minimal vLLM modifications** - use vLLM as library, orchestrate externally
+- **One model active at a time** — maximizes KV cache for the live model.
+- **Subprocess teardown per swap** — OS reclaims VRAM; ~0 MiB drift over 50+ swaps.
+- **Drain before switch** — same-model requests arriving after a cross-model request still get served on the active engine.
+- **Pipeline don't predict** — only fact-based prefetch (a request for model B has actually arrived) triggers the next model's load. No speculative warming.
+- **Single 80 GB pool** — never duplicated; overwritten in place per swap.
+- **Single in-flight swap** — dispatcher's `if swap_task is None` gate ensures we never have two subprocess loads racing for the GPU.
 
 ## Target Hardware
 
