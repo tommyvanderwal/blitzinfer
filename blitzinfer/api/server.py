@@ -175,9 +175,16 @@ REGISTRY: dict[str, ModelConfig] = {
         ],
     ),
     "kimi-vl": ModelConfig(
+        # Kimi-VL is ChatML-style and not a thinking model; hermes is the
+        # generic ChatML-compatible tool parser. Without --tool-call-parser
+        # set, requests with `tool_choice: "auto"` (which agent clients
+        # send by default) get a 400 from vLLM — even when the message
+        # carries no actual tools. hermes tolerates non-tool responses by
+        # leaving tool_calls[] empty.
         served_name="kimi-vl",
         repo="moonshotai/Kimi-VL-A3B-Instruct",
         max_model_len=131072,
+        tool_parser="hermes",
         extra_args=["--trust-remote-code"],
     ),
 }
