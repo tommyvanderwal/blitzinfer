@@ -4,6 +4,24 @@ A multi-model LLM serving gateway built on [vLLM](https://github.com/vllm-projec
 
 One vLLM EngineCore at a time, full GPU per model, OpenAI-compatible REST API, ~0 MiB VRAM drift across rotations.
 
+> **Heads up — this is a one-machine project.** It is hand-tuned for the specific box below: an RTX PRO 6000 (96 GB) on a Ryzen 7 7800X3D with 128 GB DDR5 in a PCIe 5.0 x16 slot. Tuning, registry, page sizes, pool size, and several timings all assume that hardware. Public and free to try if you have something similar — but **YMMV** on anything else, and "anything else" includes other Blackwells with less VRAM, slower CPUs, fewer PCIe lanes, or less host RAM.
+>
+> Built specifically to keep one big GPU saturated by rotating through whatever model the next request asks for, as fast as possible. Not a general-purpose multi-GPU serving stack.
+
+## Target machine
+
+| Component | This box |
+|---|---|
+| GPU | NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 96 GB GDDR7 (SM120) |
+| CPU | AMD Ryzen 7 7800X3D |
+| GPU slot | PCIe 5.0 ×16 |
+| System RAM | 128 GB DDR5 |
+| Storage | NVMe (PCIe 4.0+) for the HF model cache |
+| OS | Ubuntu 24.04 LTS, kernel ≥ 6.8, with `hugepagesz=1G hugepages=80` on the kernel cmdline |
+| Software | vLLM 0.20.1, PyTorch 2.11+cu130, FlashInfer 0.6.8.post1, Python 3.13 |
+
+If your hardware is meaningfully different — less VRAM, no SM120, slow PCIe, less than ~110 GB usable RAM — expect to need to retune or skip parts of the design (the 80 GB pinned pool is the most likely thing to fight you).
+
 ## What it does
 
 You point it at a registry of models. Requests come in over `/v1/chat/completions`. The gateway:
@@ -20,15 +38,6 @@ You point it at a registry of models. Requests come in over `/v1/chat/completion
 Compared to running `vllm serve` per model: you don't pay the 60–120 s cold-load cost on every cross-model request — most of it is hidden behind the previous model's serving.
 
 Compared to LM Studio / Ollama / GGUF stacks: you keep vLLM's full performance (CUDA graphs, FlashAttention, FP8/MXFP4/NVFP4 kernels, prefix caching, 32-way concurrency per model).
-
-## Hardware
-
-- NVIDIA Blackwell (SM120) GPU with ≥ 90 GB VRAM. Tested on RTX PRO 6000 Blackwell Workstation Edition (95 GB).
-- ≥ 128 GB system RAM (the 80 GB hugetlbfs pool lives in RAM).
-- A fast NVMe (PCIe 4.0+) for model files. Models live in the standard HuggingFace cache (`~/.cache/huggingface/hub`).
-- Ubuntu 24.04+ with kernel ≥ 6.8 and `hugepagesz=1G hugepages=80` on the kernel cmdline (so 80 × 1 GB hugepages back the pool).
-
-The dev box this was built on is a Ryzen 9950X3D + RTX PRO 6000 + 124 GB DDR5.
 
 ## Install
 
@@ -151,8 +160,8 @@ Two invariants:
 
 `CLAUDE.md` has the long version for contributors.
 
-## License
+## License & status
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). vLLM is Apache 2.0 and stays a pip dependency; the two `.patch` files in `patches/` are MIT-licensed (authored diffs). When applied to your installed vLLM, the resulting modified files on disk remain Apache 2.0 — you can't relicense vLLM's code, only your own contribution.
 
-vLLM is Apache 2.0 and stays a pip dependency; the two `.patch` files in `patches/` are MIT-licensed (your authored diffs). When applied to your installed vLLM, the resulting modified files on disk remain Apache 2.0 — you can't relicense vLLM's code, only your own contribution.
+No support, no warranty, no roadmap commitments — see the LICENSE for the legalese version. This is one person's tuning effort for one specific box, made public on the off chance it's useful to someone with the same hardware. Issues / PRs are welcome but I make no promise to act on them.
