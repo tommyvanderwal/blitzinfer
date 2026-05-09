@@ -120,6 +120,7 @@ REGISTRY: dict[str, ModelConfig] = {
         served_name="qwen3.6-35b-a3b",
         repo="Qwen/Qwen3.6-35B-A3B-FP8",
         max_model_len=262144,
+        gpu_util=0.93,  # vision MoE; leave ~7 GiB for image-encoder runtime
         tool_parser="qwen3_xml",
         reasoning_parser="qwen3",
     ),
@@ -127,6 +128,7 @@ REGISTRY: dict[str, ModelConfig] = {
         served_name="qwen3.6-27b",
         repo="Qwen/Qwen3.6-27B-FP8",
         max_model_len=262144,
+        gpu_util=0.93,  # vision dense; leave ~7 GiB for image-encoder runtime
         tool_parser="qwen3_xml",
         reasoning_parser="qwen3",
     ),
@@ -142,6 +144,7 @@ REGISTRY: dict[str, ModelConfig] = {
         served_name="gpt-oss-120b",
         repo="openai/gpt-oss-120b",
         max_model_len=131072,
+        gpu_util=0.95,  # text-only MXFP4; KV jumps ~12 → ~22 GB
         tool_parser="openai",
         reasoning_parser="openai_gptoss",
         env={"VLLM_MXFP4_USE_MARLIN": "1"},
@@ -150,13 +153,14 @@ REGISTRY: dict[str, ModelConfig] = {
         served_name="qwen3-coder-next",
         repo="Qwen/Qwen3-Coder-Next-FP8",
         max_model_len=262144,
-        gpu_util=0.93,  # 75GB weights at 256K need every spare GiB
+        gpu_util=0.95,  # text-only FP8 MoE 75 GB — every spare GiB for KV
         tool_parser="qwen3_coder",
     ),
     "qwen3-32b": ModelConfig(
         served_name="qwen3-32b",
         repo="Qwen/Qwen3-32B-FP8",
         max_model_len=131072,
+        gpu_util=0.95,  # text-only FP8 dense; KV jumps ~17 → ~24 GB
         tool_parser="qwen3_xml",
         reasoning_parser="qwen3",
         extra_args=[
