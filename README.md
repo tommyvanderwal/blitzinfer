@@ -158,7 +158,12 @@ Two invariants:
 - The 80 GB pool is never used twice. `SharedPool.load_shards` overwrites in place; once a subprocess has copied weights pool → GPU it never reads pool again.
 - Never two subprocess loads in parallel. The dispatcher's `if swap_task is None` gate ensures a second swap can't begin until the current one's subprocess is fully loaded. Pipelining overlaps loading with *serving*, not with another loading.
 
-`CLAUDE.md` has the long version for contributors.
+## Deeper docs
+
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — request lifecycle, swap stages, dispatcher state machine, memory map, vLLM patches, all with ASCII diagrams.
+- **[docs/DESIGN.md](docs/DESIGN.md)** — the *why* behind each major choice (subprocess-per-swap, hugetlbfs pool, drain-then-switch, GPU barrier, MM-warmup skip, profile cache), what was tried and reverted (`fork` mode, page-cache warming, leak chasing), and known issues with documented workarounds.
+
+`CLAUDE.md` is internal contributor notes (older, semi-stale in places — the docs above supersede it for the gateway architecture).
 
 ## License & status
 
