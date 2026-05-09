@@ -1,0 +1,35 @@
+[Unit]
+Description=BlitzInfer multi-model LLM gateway
+Documentation=https://github.com/tommyvanderwal/blitzinfer
+After=network-online.target mnt-hugetlbfs.mount
+Wants=network-online.target
+Requires=mnt-hugetlbfs.mount
+
+[Service]
+Type=simple
+User=tommy
+Group=tommy
+WorkingDirectory=/home/tommy/pythonprojects/blitzinfer
+Environment=PATH=/usr/local/cuda-13.1/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/tommy/pythonprojects/blitzinfer
+Environment=VLLM_WORKER_MULTIPROC_METHOD=spawn
+ExecStart=/home/tommy/pythonprojects/blitzinfer/venv_vllm_2026q2/bin/python -u -m blitzinfer.api.server
+# Graceful shutdown for vLLM EngineCore subprocesses.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+# The gateway mmaps an 80 GB hugetlbfs region; without unlimited mlock
+# the parent's mmap is fine (hugepages are not subject to mlock limits)
+# but subprocess cudaHostRegister can hit RLIMIT_MEMLOCK on some setups.
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blitzinfer
+
+[Install]
+WantedBy=multi-user.target

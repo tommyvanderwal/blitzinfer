@@ -68,12 +68,29 @@ sudo update-grub && sudo reboot
 
 ## Run
 
+### Foreground (development)
+
 ```bash
 # Optional — preload a model on startup:
 export BLITZ_DEFAULT_MODEL=qwen3-coder-next
 
 python -m blitzinfer.api.server
 ```
+
+### As a systemd service (production / boot)
+
+```bash
+sudo install -m 644 scripts/blitzinfer.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now blitzinfer.service
+
+# Inspect:
+systemctl status blitzinfer.service
+journalctl -u blitzinfer.service -f
+```
+
+The unit waits on `mnt-hugetlbfs.mount` so the 80 GB pool is available before
+the gateway starts; on a cold boot it comes up ~30–40 s after `multi-user.target`.
 
 The server listens on `0.0.0.0:8000`. Hit it like any OpenAI endpoint:
 
