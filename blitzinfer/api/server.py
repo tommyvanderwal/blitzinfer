@@ -136,13 +136,23 @@ REGISTRY: dict[str, ModelConfig] = {
         # — the plugin path didn't work because plugins register inside the
         # subprocess and create_engine_config validates in the parent.
         #
-        # Native context is 1M; capped at 256K (won't fit KV at higher).
+        # Running at native 1M context. The hybrid Mamba layers don't grow
+        # KV with sequence length, so 1M fits at ~3-4x concurrency vs 14x
+        # at 256K (the per-seq attention-KV does scale 4x). VLLM_ALLOW_
+        # LONG_MAX_MODEL_LEN=1 needed because vLLM gates super-long
+        # context behind this env var.
+        #
+        # Host-memory cold-compile spike scales with max_model_len —
+        # measured 33 GB at 256K, expect ~130 GB at 1M. The 160 GB
+        # swapfile (see install docs) absorbs this; once compile cache is
+        # warm on disk, subsequent loads skip the spike entirely.
         served_name="nemotron-3-super",
         repo="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-        max_model_len=262144,
+        max_model_len=1048576,
         gpu_util=0.93,
         tool_parser="qwen3_coder",
         reasoning_parser="nemotron_v3",
+        env={"VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"},
         extra_args=[
             "--trust-remote-code",
             "--kv-cache-dtype", "fp8",
