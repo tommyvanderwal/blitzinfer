@@ -29,19 +29,10 @@ import collections
 import functools
 import logging
 import os
-import pathlib
 import sys
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-
-# Repo root → plugins/ — used for vLLM reasoning-parser plugins that ship
-# alongside specific model cards (e.g. NVIDIA's super_v3 parser for
-# Nemotron-3). server.py lives at <repo>/blitzinfer/api/server.py, so go
-# up two parents to reach the repo root.
-_PLUGIN_DIR = (
-    pathlib.Path(__file__).resolve().parent.parent.parent / "plugins"
-).as_posix()
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -136,34 +127,26 @@ REGISTRY: dict[str, ModelConfig] = {
     ),
     "nemotron-3-super": ModelConfig(
         # NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 — hybrid LatentMoE
-        # Mamba-Transformer (12B active params) with Multi-Token
-        # Prediction. Per the model card:
-        #   https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
-        # Requires:
-        #   --trust-remote-code            (custom model code)
-        #   --reasoning-parser super_v3    (registered by the plugin file)
-        #   --reasoning-parser-plugin …    (file at plugins/ in this repo)
-        #   --tool-call-parser qwen3_coder (NVIDIA's choice)
-        #   --kv-cache-dtype fp8           (KV in FP8 to fit at 256K)
-        #   --mamba-ssm-cache-dtype float16
-        #   --swap-space 0                 (vLLM's own internal swap off;
-        #                                   we use a host swapfile already)
-        # Native context 1M; we cap at 256K — 1M would not fit KV at any
-        # quant on this box and our cold-load host-memory spike risk gets
-        # worse with longer contexts (see qwen3.5-122b-a10b notes).
+        # Mamba-Transformer (12B active params) with Multi-Token Prediction.
+        # Model card: https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+        #
+        # The model card says to use a `super_v3` reasoning parser shipped
+        # as a plugin file, but vLLM 0.20.1 ships a native `nemotron_v3`
+        # parser (vllm/reasoning/nemotron_v3_reasoning_parser.py); use that
+        # — the plugin path didn't work because plugins register inside the
+        # subprocess and create_engine_config validates in the parent.
+        #
+        # Native context is 1M; capped at 256K (won't fit KV at higher).
         served_name="nemotron-3-super",
         repo="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
         max_model_len=262144,
         gpu_util=0.93,
         tool_parser="qwen3_coder",
-        reasoning_parser="super_v3",
+        reasoning_parser="nemotron_v3",
         extra_args=[
             "--trust-remote-code",
-            "--reasoning-parser-plugin",
-            f"{_PLUGIN_DIR}/super_v3_reasoning_parser.py",
             "--kv-cache-dtype", "fp8",
             "--mamba-ssm-cache-dtype", "float16",
-            "--swap-space", "0",
         ],
     ),
     "qwen3.6-35b-a3b": ModelConfig(
