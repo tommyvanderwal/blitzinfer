@@ -108,10 +108,19 @@ REGISTRY: dict[str, ModelConfig] = {
         # 122B total / 10B active MoE multimodal, 75 GB on disk in NVFP4.
         # Per RedHatAI HF page: --reasoning-parser qwen3 --tool-call-parser
         # qwen3_coder --moe-backend flashinfer_cutlass.
+        #
+        # Memory note (May 13, 2026): the cold load's CUDA-graph capture +
+        # FlashInfer JIT briefly spikes host memory by ~33 GB. With the
+        # 80 GB hugetlbfs pool + ~3 GB baseline = 83 GB locked, the box's
+        # 124 GB RAM has ~41 GB of headroom — just below the spike. A 32 GB
+        # swapfile absorbs the brief overflow during graph capture; once
+        # capture completes, host memory drops back to ~7 GB and swap is
+        # reclaimed. gpu_util pulled to 0.92 (from 0.93) for a touch more
+        # GPU-side margin too.
         served_name="qwen3.5-122b-a10b",
         repo="RedHatAI/Qwen3.5-122B-A10B-NVFP4",
         max_model_len=262144,
-        gpu_util=0.93,  # 75 GB weights leave ~17 GiB for KV at 256K
+        gpu_util=0.92,
         tool_parser="qwen3_coder",
         reasoning_parser="qwen3",
         extra_args=["--moe-backend", "flashinfer_cutlass"],

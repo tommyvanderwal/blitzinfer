@@ -66,6 +66,44 @@ hugetlbfs /mnt/hugetlbfs hugetlbfs pagesize=1G,size=80G,mode=0777 0 0
 sudo update-grub && sudo reboot
 ```
 
+### 64 GB swapfile (required for 122B-class models at 256K context)
+
+The 80 GB hugetlbfs pool pins 80 of the box's 124 GB of RAM. With ~3 GB
+baseline (no GUI; see below) that leaves ~41 GB host headroom for the
+gateway parent + EngineCore subprocess + their working set. For most
+models that's plenty — but the **cold load of qwen3.5-122b-a10b at 256K
+context spikes host memory ~40 GB during CUDA graph capture + FlashInfer
+JIT**, briefly exceeding the headroom. The spike is transient (~60 s) and
+fully reclaims after capture completes, so a 64 GB swapfile absorbs it
+cleanly:
+
+```bash
+sudo fallocate -l 64G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo "/swapfile none swap sw 0 0" | sudo tee -a /etc/fstab
+```
+
+Observed peak: 39 GB swap during the 122b cold compile; back to ~3 GB
+within 90 s and 0 GB shortly after. The compile cache is then warm and
+subsequent loads of 122b skip the spike entirely.
+
+### Run headless (no GUI) — recommended
+
+The GUI (gdm + gnome-shell + mutter + Xorg) eats ~3 GB of baseline RAM
+which is just enough to push the 122b cold-load spike over the edge even
+with the 64 GB swap. Disable for a serving-only box:
+
+```bash
+sudo systemctl set-default multi-user.target
+sudo systemctl mask gdm.service
+sudo reboot
+```
+
+You'll lose the local console GUI but everything else (SSH, the gateway,
+remote agents) keeps working identically.
+
 ## Run
 
 ### Foreground (development)
